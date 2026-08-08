@@ -1,11 +1,11 @@
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/你的用户名/你的仓库/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/GaryTung/newinstall/main/install.sh)
 ```
 
 自定义管理端口和本机代理端口：
 
 ```bash
-UI_PORT=18877 PROXY_PORT=17928 bash <(curl -fsSL https://raw.githubusercontent.com/你的用户名/你的仓库/main/install.sh)
+UI_PORT=18877 PROXY_PORT=17928 bash <(curl -fsSL https://raw.githubusercontent.com/GaryTung/newinstall/main/install.sh)
 ```
 
 `install.sh` 已嵌入完整、经过校验的 AimiliVPN 安装包。运行时会先验证 SHA-256，再解压到临时目录并调用正式安装器。
