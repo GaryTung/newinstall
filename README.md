@@ -1,5 +1,5 @@
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/GaryTung/newinstall/main/install.sh)
+curl -fsSL https://raw.githubusercontent.com/GaryTung/newinstall/main/install.sh | sudo bash
 ```
 
 自定义管理端口和本机代理端口：
