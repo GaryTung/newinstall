@@ -15,6 +15,36 @@ import uuid
 from pathlib import Path
 
 
+def default_xray_template():
+    """Return the 3x-ui v3 built-in baseline used when a fresh DB has no row."""
+    return {
+        "api": {"services": ["HandlerService", "LoggerService", "StatsService", "RoutingService"], "tag": "api"},
+        "inbounds": [{
+            "listen": "127.0.0.1", "port": 62789, "protocol": "tunnel",
+            "settings": {"rewriteAddress": "127.0.0.1"}, "tag": "api",
+        }],
+        "log": {"access": "none", "dnsLog": False, "error": "", "loglevel": "warning", "maskAddress": ""},
+        "metrics": {"listen": "127.0.0.1:11111", "tag": "metrics_out"},
+        "outbounds": [
+            {"protocol": "freedom", "settings": {"domainStrategy": "AsIs", "finalRules": [
+                {"action": "block", "ip": ["geoip:private"]}, {"action": "allow"},
+            ]}, "tag": "direct"},
+            {"protocol": "blackhole", "settings": {}, "tag": "blocked"},
+        ],
+        "policy": {
+            "levels": {"0": {"statsUserDownlink": True, "statsUserUplink": True}},
+            "system": {"statsInboundDownlink": True, "statsInboundUplink": True,
+                       "statsOutboundDownlink": False, "statsOutboundUplink": False},
+        },
+        "routing": {"domainStrategy": "AsIs", "rules": [
+            {"inboundTag": ["api"], "outboundTag": "api", "type": "field"},
+            {"ip": ["geoip:private"], "outboundTag": "blocked", "type": "field"},
+            {"outboundTag": "blocked", "protocol": ["bittorrent"], "type": "field"},
+        ]},
+        "stats": {},
+    }
+
+
 def compact(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -120,9 +150,10 @@ def source_inbound(db):
 
 def update_xray_template(db, routes, direct_tag, old_direct_tag, partial=False, direct_only=False):
     row = db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()
-    if not row:
-        raise RuntimeError("3x-ui 缺少 xrayTemplateConfig")
-    config = json.loads(row[0])
+    if row and str(row[0] or "").strip():
+        config = json.loads(row[0])
+    else:
+        config = default_xray_template()
     prefixes = ("VPNGATE-COUNTRY-",)
     outbounds = config.setdefault("outbounds", [])
     rules = config.setdefault("routing", {}).setdefault("rules", [])
@@ -157,7 +188,11 @@ def update_xray_template(db, routes, direct_tag, old_direct_tag, partial=False, 
             "type": "field", "inboundTag": [route["inbound_tag"]],
             "outboundTag": route["outbound_tag"], "enabled": True,
         })
-    db.execute("update settings set value=? where key='xrayTemplateConfig'", (compact(config),))
+    row = db.execute("select id from settings where key='xrayTemplateConfig'").fetchone()
+    if row:
+        db.execute("update settings set value=? where key='xrayTemplateConfig'", (compact(config),))
+    else:
+        db.execute("insert into settings(key,value) values('xrayTemplateConfig',?)", (compact(config),))
 
 
 def delete_channel(database: Path, result_path: Path, channel_id: str):

@@ -13,6 +13,36 @@ import uuid
 from pathlib import Path
 
 
+def default_xray_template():
+    """Return the 3x-ui v3 built-in baseline used when a fresh DB has no row."""
+    return {
+        "api": {"services": ["HandlerService", "LoggerService", "StatsService", "RoutingService"], "tag": "api"},
+        "inbounds": [{
+            "listen": "127.0.0.1", "port": 62789, "protocol": "tunnel",
+            "settings": {"rewriteAddress": "127.0.0.1"}, "tag": "api",
+        }],
+        "log": {"access": "none", "dnsLog": False, "error": "", "loglevel": "warning", "maskAddress": ""},
+        "metrics": {"listen": "127.0.0.1:11111", "tag": "metrics_out"},
+        "outbounds": [
+            {"protocol": "freedom", "settings": {"domainStrategy": "AsIs", "finalRules": [
+                {"action": "block", "ip": ["geoip:private"]}, {"action": "allow"},
+            ]}, "tag": "direct"},
+            {"protocol": "blackhole", "settings": {}, "tag": "blocked"},
+        ],
+        "policy": {
+            "levels": {"0": {"statsUserDownlink": True, "statsUserUplink": True}},
+            "system": {"statsInboundDownlink": True, "statsInboundUplink": True,
+                       "statsOutboundDownlink": False, "statsOutboundUplink": False},
+        },
+        "routing": {"domainStrategy": "AsIs", "rules": [
+            {"inboundTag": ["api"], "outboundTag": "api", "type": "field"},
+            {"ip": ["geoip:private"], "outboundTag": "blocked", "type": "field"},
+            {"outboundTag": "blocked", "protocol": ["bittorrent"], "type": "field"},
+        ]},
+        "stats": {},
+    }
+
+
 def compact(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -118,9 +148,10 @@ def make_inbound(protocol, port, cert_file, key_file, server_name):
 
 def modify_xray_template(db, tag, proxy_port):
     row = db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()
-    if not row:
-        raise RuntimeError("3x-ui 缺少 xrayTemplateConfig 设置")
-    config = json.loads(row[0])
+    if row and str(row[0] or "").strip():
+        config = json.loads(row[0])
+    else:
+        config = default_xray_template()
     outbounds = config.setdefault("outbounds", [])
     outbounds[:] = [o for o in outbounds if o.get("tag") != "VPNGATE-AUTO"]
     outbounds.append({

@@ -1,3 +1,10 @@
+# xui-template-init.34
+
+- 兼容 3x-ui 3.7.0 新安装数据库不含 `xrayTemplateConfig` 的情况；
+- 缺少设置时自动写入 3x-ui v3 官方基础 Xray 模板；
+- 同时修复首次直连节点配置和后续多国家线路配置；
+- 已有 Xray 模板仍采用增量修改，不覆盖用户现有配置。
+
 # open-host-firewall.33
 
 - Ubuntu/Debian 一键安装默认关闭 UFW 与 netfilter-persistent；

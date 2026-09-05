@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
+import json
 import re
+import sqlite3
 import unittest
 from pathlib import Path
 
@@ -100,6 +103,41 @@ class Stability31PackageTests(unittest.TestCase):
             'ufw --force disable',
         ):
             self.assertIn(marker, unified)
+
+    def test_fresh_xui_database_gets_default_xray_template(self) -> None:
+        for name in ("xui_provision.py", "xui_multi_provision.py"):
+            source = (ROOT / name).read_text(encoding="utf-8")
+            self.assertIn("def default_xray_template", source)
+            self.assertIn('"protocol": "freedom"', source)
+            self.assertIn('"tag": "direct"', source)
+            self.assertIn('"tag": "blocked"', source)
+            self.assertNotIn("3x-ui 缺少 xrayTemplateConfig", source)
+
+        def load_module(name: str):
+            spec = importlib.util.spec_from_file_location(name, ROOT / f"{name}.py")
+            module = importlib.util.module_from_spec(spec)
+            assert spec.loader is not None
+            spec.loader.exec_module(module)
+            return module
+
+        db = sqlite3.connect(":memory:")
+        db.execute("create table settings(id integer primary key, key text unique, value text)")
+        single = load_module("xui_provision")
+        single.modify_xray_template(db, "in-test", 7928)
+        config = json.loads(db.execute(
+            "select value from settings where key='xrayTemplateConfig'"
+        ).fetchone()[0])
+        self.assertTrue(any(item.get("tag") == "direct" for item in config["outbounds"]))
+        self.assertTrue(any(item.get("tag") == "VPNGATE-AUTO" for item in config["outbounds"]))
+
+        db.execute("delete from settings")
+        multi = load_module("xui_multi_provision")
+        multi.update_xray_template(db, [], "in-direct", "in-direct")
+        config = json.loads(db.execute(
+            "select value from settings where key='xrayTemplateConfig'"
+        ).fetchone()[0])
+        self.assertTrue(any(item.get("tag") == "blocked" for item in config["outbounds"]))
+        db.close()
 
     def test_repository_contains_no_runtime_credentials(self) -> None:
         forbidden_paths = (
