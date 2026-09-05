@@ -861,6 +861,37 @@ def multi_exit_auto_recovery_loop() -> None:
         time.sleep(MULTI_RECOVERY_POLL_SECONDS)
 
 
+bootstrap_workers: dict[str, threading.Thread] = {}
+bootstrap_workers_lock = threading.Lock()
+
+
+def ensure_channel_bootstrap(channel_id: str) -> None:
+    """Start at most one bootstrap worker per country, including late installs."""
+    if not channel_id:
+        return
+    with bootstrap_workers_lock:
+        for cid, worker in list(bootstrap_workers.items()):
+            if not worker.is_alive():
+                bootstrap_workers.pop(cid, None)
+        if channel_id in bootstrap_workers:
+            return
+        worker = threading.Thread(target=bootstrap_new_channel, args=(channel_id,), daemon=True)
+        bootstrap_workers[channel_id] = worker
+        worker.start()
+
+
+def bootstrap_supervisor_loop() -> None:
+    """Discover channels created after the web manager was already started."""
+    while True:
+        try:
+            for channel in read_multi_exit_config().get("channels", []):
+                if channel.get("enabled", True) and channel.get("awaiting_initial_test"):
+                    ensure_channel_bootstrap(str(channel.get("id") or ""))
+        except Exception as exc:
+            print(f"[bootstrap supervisor] retrying: {exc}", flush=True)
+        time.sleep(5)
+
+
 def bootstrap_new_channel(channel_id: str) -> None:
     """Release a new country after its first verified node; fill reserves later."""
     attempted: set[str] = set()
@@ -871,7 +902,7 @@ def bootstrap_new_channel(channel_id: str) -> None:
             _, channel = find_multi_channel(config, channel_id)
         except ValueError:
             return
-        if not channel.get("awaiting_initial_test"):
+        if not channel.get("enabled", True) or not channel.get("awaiting_initial_test"):
             return
         if maintenance_lock.locked() or is_connecting:
             time.sleep(2)
@@ -4948,6 +4979,39 @@ INDEX_HTML = r"""<!doctype html>
       <!-- Rendered dynamically by render() -->
     </section>
 
+  <style>
+    #multi_exit_panel {background:transparent;border:0;padding:0;box-shadow:none}
+    #multi_exit_panel .quick-routing-header {padding:20px 0;border-bottom:1px solid var(--border-color)}
+    #multi_exit_panel .quick-routing-title {font-size:24px;letter-spacing:-.5px}
+    #direct_node_row>div {border-left:4px solid #60a5fa!important;background:rgba(59,130,246,.10)!important;border-radius:16px!important;padding:20px!important}
+    #bundle_subscription_row>div {border-left:4px solid #a78bfa!important;background:rgba(139,92,246,.10)!important;border-radius:16px!important;padding:20px!important}
+    #multi_exit_rows {gap:20px!important}
+    .country-card {--channel-color:#fbbf24;border:1px solid var(--border-color);border-top:4px solid var(--channel-color);border-radius:16px;padding:22px;background:rgba(148,163,184,.04)}
+    .country-card[data-health=connected] {--channel-color:#34d399;background:rgba(16,185,129,.045)}
+    .country-card[data-health=failed] {--channel-color:#fb7185;background:rgba(244,63,94,.045)}
+    .channel-facts {display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:18px 0}
+    .channel-facts>div {background:rgba(148,163,184,.08);border:1px solid var(--border-color);padding:14px;border-radius:10px;font-size:13px;line-height:1.8}
+    .channel-facts small,.channel-fields label {display:block;color:var(--text-secondary);font-size:12px}
+    .channel-facts strong {display:block;font-size:18px;font-variant-numeric:tabular-nums;color:var(--text-primary)}
+    .channel-fields {display:grid;grid-template-columns:1.2fr 110px 110px 1.2fr;gap:12px;margin:16px 0}
+    .channel-fields .input-field {width:100%;margin-top:6px}
+    .country-card details {margin-top:18px!important;background:rgba(148,163,184,.025)}
+    .country-card details summary {padding:15px!important}
+    .country-card .toolbar-btn {min-height:38px;border-radius:8px}
+    .country-card button[onclick^="saveMultiExitChannel"] {background:#2563eb;color:white;border-color:#2563eb}
+    .channel-state-note {font-size:12px;color:var(--text-secondary);margin:12px 0;line-height:1.7}
+    .channel-overview {display:flex;gap:10px;flex-wrap:wrap;margin:18px 0}
+    .channel-overview span {padding:8px 14px;border-radius:9px;background:rgba(148,163,184,.1);font-size:13px}
+    @media(max-width:760px){
+      #direct_node_row>div {grid-template-columns:1fr 1fr!important}
+      #bundle_subscription_row>div {flex-direction:column;align-items:flex-start!important}
+      .channel-fields {grid-template-columns:1fr 1fr}
+      .channel-facts {grid-template-columns:1fr}
+      .country-card {padding:15px}
+      .country-card details>div {min-width:0}
+      .country-card details label {min-width:620px}
+    }
+  </style>
   <section class="quick-routing-panel" id="multi_exit_panel" style="margin-bottom:18px;">
     <div class="quick-routing-header">
       <div><div class="quick-routing-title">多国家独立出口</div><div class="quick-routing-summary">每个国家独立配置、检测和切换 IP；健康线路保持当前连接</div></div>
@@ -4955,7 +5019,8 @@ INDEX_HTML = r"""<!doctype html>
     </div>
     <div id="direct_node_row" style="margin-top:14px;"></div>
     <div id="bundle_subscription_row" style="margin-top:10px;"></div>
-    <div style="font-size:13px;font-weight:700;margin-top:14px;">国家线路与候选 IP</div>
+    <div id="channel_overview" class="channel-overview"></div>
+    <div style="font-size:17px;font-weight:700;margin-top:24px;">国家出口 <span style="font-size:12px;font-weight:400;color:var(--text-secondary)">绿色：已连接 · 黄色：检测 / 连接 · 红色：恢复中</span></div>
     <div id="multi_exit_rows" style="display:grid;gap:10px;margin-top:10px;"></div>
     <div id="multi_exit_message" class="quick-routing-message" style="margin-top:12px;">顶部更新按钮只更新节点资料；检测与切换请在对应国家卡片中操作。</div>
   </section>
@@ -5516,6 +5581,9 @@ function renderMultiExit(){
   if(bundleBox)bundleBox.innerHTML=bundle.universal?`<div style="display:flex;justify-content:space-between;gap:12px;align-items:center;padding:12px 14px;border:1px solid var(--border-color);border-radius:10px;background:rgba(139,92,246,.07)"><div><strong>总节点订阅</strong><div style="font-size:12px;color:var(--text-secondary);margin-top:4px">包含 VPS 直连及全部已启用国家出口</div></div><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="toolbar-btn" onclick="copyBundleSubscription('universal')">复制通用订阅链接</button><button class="toolbar-btn" onclick="copyBundleSubscription('clash')">复制 Clash/Mihomo 订阅链接</button></div></div>`:'';
   const box=$("multi_exit_rows"); if(!box)return;
   const runtime=(multiExitData.state&&multiExitData.state.channels)||{};
+  const channels=multiExitData.config.channels||[];
+  const connectedCount=channels.filter(c=>(runtime[c.id]||{}).status==='connected').length;
+  if($('channel_overview'))$('channel_overview').innerHTML=`<span>国家出口 <b>${channels.length}</b></span><span style="color:#34d399">已连接 <b>${connectedCount}</b></span><span style="color:#fbbf24">待连接 <b>${channels.length-connectedCount}</b></span><span>自动检测已配置国家 · 健康出口保持原 IP</span>`;
   box.innerHTML=(multiExitData.config.channels||[]).map((c,i)=>{
     const s=runtime[c.id]||{}; const status=s.status||(c.awaiting_initial_test?'testing':'connecting'); const ok=status==="connected"; const pending=['connecting','switching','testing'].includes(status); const candidates=c.candidates||[];
     const available=candidates.filter(n=>n.probe_status==='available'&&multiCandidateMatchesPolicy(n,c.ip_type)).length;
@@ -5523,9 +5591,12 @@ function renderMultiExit(){
     const rows=candidates.map(n=>{const current=n.id===s.node_id;const preferred=n.id===c.preferred_node_id;const checked=n.id===selectedNodeId;return `<label style="display:grid;grid-template-columns:28px 1.2fr .8fr 1.2fr .7fr .7fr;gap:8px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--border-color);border-left:4px solid ${n.probe_status==='available'?'#22c55e':(n.probe_status==='unavailable'?'#ef4444':'#f59e0b')};font-size:12px;background:${multiRowBackground(n.probe_status)};${current?'font-weight:700;outline:1px solid rgba(59,130,246,.55);outline-offset:-1px;':''}">
       <input type="radio" name="candidate-${esc(c.id)}" value="${esc(n.id)}" ${checked?'checked':''} onchange="rememberMultiExitCandidate('${esc(c.id)}','${esc(n.id)}')">
       <span>${esc(n.ip||n.entry_ip||'-')}${current?' <b style="color:var(--success)">当前</b>':''}</span><span>${esc(multiIpTypeLabel(n.ip_type))}</span><span title="${esc(n.owner||'')}">${esc(n.owner||'-')}</span><span>${esc(multiProbeLabel(n.probe_status))}</span><span>${n.latency_ms?esc(n.latency_ms+' ms'):'-'}</span></label>`;}).join('');
-    return `<section data-channel-card="${esc(c.id)}" style="border:1px solid var(--border-color);border-radius:12px;padding:14px;background:rgba(255,255,255,.025)">
-      <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start"><div><strong style="font-size:16px">${esc(c.country||c.name||c.id)}独立出口</strong><div style="font-size:12px;color:var(--text-secondary);margin-top:5px">入口节点：${esc(s.entry_ip||'读取中')} · 服务商：${esc(s.entry_provider||'读取中')}</div><div style="font-size:12px;color:var(--text-secondary);margin-top:3px">实际出口：${esc(s.exit_ip||'尚未连接')} · 服务商：${esc(s.exit_provider||'读取中')} · ${esc(s.exit_country_code||'')} · ${esc(status)}</div></div><span class="badge ${ok?'available':(pending?'testing':'unavailable')}">${ok?'已连接':(pending?'连接中':'不可用/重试中')}</span></div>
-      <div style="display:grid;grid-template-columns:1.2fr 110px 110px 1.2fr;gap:9px;margin-top:14px"><select data-field="country" class="input-field">${multiCountryOptions(c.country)}</select><input data-field="inbound_port" type="number" min="1024" max="65535" class="input-field" value="${c.inbound_port}"><select data-field="protocol" class="input-field"><option value="vless" ${c.protocol==='vless'?'selected':''}>VLESS</option><option value="trojan" ${c.protocol==='trojan'?'selected':''}>Trojan</option><option value="hysteria" ${(c.protocol||'hysteria')==='hysteria'?'selected':''}>HY2</option></select><select data-field="ip_type" class="input-field"><option value="all" ${c.ip_type==='all'?'selected':''}>全部 IP</option><option value="residential_preferred" ${c.ip_type==='residential_preferred'?'selected':''}>住宅优先</option><option value="residential_only" ${c.ip_type==='residential_only'?'selected':''}>仅住宅</option><option value="hosting_only" ${c.ip_type==='hosting_only'?'selected':''}>仅机房</option></select></div>
+    const stateLabel=ok?'已连接':(c.awaiting_initial_test?'等待 / 首次检测':status==='testing'?'正在检测':pending?'正在连接':'断线恢复中');
+    return `<section class="country-card" data-health="${ok?'connected':pending?'pending':'failed'}" data-channel-card="${esc(c.id)}">
+      <div style="display:flex;justify-content:space-between;gap:12px;align-items:center"><div><strong style="font-size:20px">${esc(c.country||c.name||c.id)}</strong><span style="font-size:12px;color:var(--text-secondary);margin-left:12px">${esc(multiProtocolLabel(c.protocol))} · ${esc(c.inbound_port)}</span></div><span class="badge ${ok?'available':(pending?'testing':'unavailable')}">${stateLabel}</span></div>
+      <div class="channel-facts"><div><small>中转入口 · VPNGate 节点</small><strong>${esc(s.entry_ip||'尚未选定')}</strong>${esc(s.entry_provider||'选定节点后显示服务商')}</div><div><small>实际公网出口</small><strong>${esc(s.exit_ip||'尚未连接')}</strong>${esc(s.exit_provider||'连接验证后显示服务商')} · ${esc(multiIpTypeLabel(s.exit_ip_type))}</div></div>
+      <div class="channel-state-note">${esc(c.awaiting_initial_test?'系统自动排队检测本国候选，找到首个合格节点后立即连接。':s.error||(ok?'出口正常，保持当前 IP；备用节点由后台维护。':'系统正在选择并验证本国出口。'))}</div>
+      <div class="channel-fields"><label>出口国家<select data-field="country" class="input-field">${multiCountryOptions(c.country)}</select></label><label>入站端口<input data-field="inbound_port" type="number" min="1024" max="65535" class="input-field" value="${c.inbound_port}"></label><label>连接协议<select data-field="protocol" class="input-field"><option value="vless" ${c.protocol==='vless'?'selected':''}>VLESS</option><option value="trojan" ${c.protocol==='trojan'?'selected':''}>Trojan</option><option value="hysteria" ${(c.protocol||'hysteria')==='hysteria'?'selected':''}>HY2</option></select></label><label>IP 选择策略<select data-field="ip_type" class="input-field"><option value="all" ${c.ip_type==='all'?'selected':''}>全部 IP</option><option value="residential_preferred" ${c.ip_type==='residential_preferred'?'selected':''}>住宅优先</option><option value="residential_only" ${c.ip_type==='residential_only'?'selected':''}>仅住宅</option><option value="hosting_only" ${c.ip_type==='hosting_only'?'selected':''}>仅机房</option></select></label></div>
       <details style="margin-top:14px;border:1px solid var(--border-color);border-radius:8px;overflow:hidden"><summary style="cursor:pointer;padding:10px 12px;background:rgba(255,255,255,.04)"><b style="font-size:13px">${esc(c.country)}候选 IP：${candidates.length} 个（可用 ${available}）</b><span style="font-size:11px;color:var(--text-secondary);margin-left:12px">默认折叠；健康节点保持连接，异常后才选择同国备用</span></summary><div style="overflow:auto;max-height:330px"><div style="display:grid;grid-template-columns:28px 1.2fr .8fr 1.2fr .7fr .7fr;gap:8px;padding:8px 10px;background:rgba(255,255,255,.05);font-size:11px;color:var(--text-secondary)"><span></span><span>IP</span><span>类型</span><span>服务商</span><span>状态</span><span>延迟</span></div>${rows||'<div style="padding:16px;color:var(--text-secondary)">暂无该国节点，请先点击顶部“更新节点资料”</div>'}</div></details>
       <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:12px"><button class="toolbar-btn" onclick="saveMultiExitChannel('${esc(c.id)}')">保存并应用本线路</button><button class="toolbar-btn" onclick="testMultiExitChannel('${esc(c.id)}')">检测本国节点可用性</button><button class="toolbar-btn" onclick="switchMultiExitNode('${esc(c.id)}')">切换到所选 IP</button>${c.universal_node?`<button class="toolbar-btn" onclick="copyChannelNode('${esc(c.id)}','universal_node')">复制通用节点链接</button>`:''}${c.clash_node?`<button class="toolbar-btn" onclick="copyChannelNode('${esc(c.id)}','clash_node')">复制 Clash/Mihomo 节点配置</button>`:''}<button class="toolbar-btn" style="border-color:rgba(239,68,68,.7);color:#ef4444" onclick="deleteMultiExitChannel('${esc(c.id)}')">删除本国通道</button><span id="channel-message-${esc(c.id)}" style="font-size:12px;color:var(--text-secondary)"></span></div>
     </section>`;
@@ -7743,7 +7814,7 @@ class Handler(BaseHTTPRequestHandler):
                         transport = "udp" if protocol == "hysteria" else "tcp"
                         subprocess.run(["ufw", "allow", f"{port}/{transport}"], check=False, timeout=15)
                 if is_new_channel or country_changed:
-                    threading.Thread(target=bootstrap_new_channel, args=(channel_id,), daemon=True).start()
+                    ensure_channel_bootstrap(channel_id)
                     message = f"{country}线路已创建，正在优先检测本国节点；完成后会按所选 IP 类型自动连接"
                 else:
                     message = f"{country}线路已单独保存并应用，其他国家配置未重建"
@@ -8393,13 +8464,7 @@ def main() -> None:
 
     migrate_multi_exit_channels()
     threading.Thread(target=collector_loop, daemon=True).start()
-    for pending_channel in read_multi_exit_config().get("channels", []):
-        if pending_channel.get("awaiting_initial_test"):
-            threading.Thread(
-                target=bootstrap_new_channel,
-                args=(str(pending_channel.get("id") or ""),),
-                daemon=True,
-            ).start()
+    threading.Thread(target=bootstrap_supervisor_loop, daemon=True).start()
     threading.Thread(target=standby_maintenance_loop, daemon=True).start()
     threading.Thread(target=multi_exit_auto_recovery_loop, daemon=True).start()
     threading.Thread(target=start_bundle_server, daemon=True).start()

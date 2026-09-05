@@ -137,6 +137,7 @@ ln -sfn /usr/local/sbin/aimilivpnctl /usr/local/bin/ml
 printf '%s\n' '[6/7] 启动服务...'
 systemctl daemon-reload
 systemctl enable --now "${APP_NAME}.service"
+systemctl restart "${APP_NAME}.service"
 sleep 5
 if ! systemctl is-active --quiet "${APP_NAME}.service"; then
   journalctl -u "${APP_NAME}.service" -n 80 --no-pager >&2 || true
