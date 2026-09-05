@@ -2415,15 +2415,18 @@ COUNTRY_DISPLAY_NAMES = {
 
 
 def channel_display_name(channel: dict[str, Any]) -> str:
-    """Return server suffix, Chinese country name and its creation date."""
+    """Return server suffix, Chinese country, protocol and creation date."""
     country = normalized_country_name(channel.get("country")) or "国家"
+    protocol = {"hysteria": "HY2", "vless": "VLESS", "trojan": "Trojan"}.get(
+        str(channel.get("protocol") or "hysteria").lower(), "HY2"
+    )
     created_at = float(channel.get("created_at") or time.time())
-    return server_node_name(f"{country}-{time.strftime('%Y%m%d', time.localtime(created_at))}")
+    return server_node_name(f"{country}-{protocol}-{time.strftime('%Y%m%d', time.localtime(created_at))}")
 
 
-def generated_channel_name(country: Any, country_nodes: list[dict[str, Any]]) -> str:
-    """Return a Chinese country name plus today's creation date."""
-    return channel_display_name({"country": country, "created_at": time.time()})
+def generated_channel_name(country: Any, country_nodes: list[dict[str, Any]], protocol: str = "hysteria") -> str:
+    """Return a distinct country/protocol name plus today's creation date."""
+    return channel_display_name({"country": country, "protocol": protocol, "created_at": time.time()})
 
 
 def normalize_node_country_catalog() -> int:
@@ -5212,7 +5215,7 @@ INDEX_HTML = r"""<!doctype html>
       <div style="display:grid;gap:14px;">
         <label style="display:grid;gap:6px;font-size:13px;"><span>节点清单国家（全部候选国家）</span><select id="new_channel_country" class="input-field" onchange="updateAddChannelCountryHint()"></select><small id="new_channel_country_hint" style="color:var(--text-secondary);"></small></label>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
-          <label style="display:grid;gap:6px;font-size:13px;"><span>节点协议</span><select id="new_channel_protocol" class="input-field"><option value="hysteria">HY2</option><option value="vless">VLESS</option><option value="trojan">Trojan</option></select></label>
+          <label style="display:grid;gap:6px;font-size:13px;"><span>节点协议</span><select id="new_channel_protocol" class="input-field" onchange="updateAddChannelCountryHint()"><option value="hysteria">HY2</option><option value="vless">VLESS</option><option value="trojan">Trojan</option></select></label>
           <label style="display:grid;gap:6px;font-size:13px;"><span>入站端口（可修改）</span><input id="new_channel_port" type="number" min="1024" max="65535" class="input-field"></label>
         </div>
         <label style="display:grid;gap:6px;font-size:13px;"><span>出口 IP 策略</span><select id="new_channel_ip_type" class="input-field"><option value="all">全部 IP</option><option value="residential_preferred" selected>住宅优先</option><option value="residential_only">仅住宅</option><option value="hosting_only">仅机房</option></select></label>
@@ -5673,9 +5676,8 @@ function addMultiExitRow(){
   openAddChannelModal();
 }
 function availableNewChannelCountries(){
-  const configured=new Set((multiExitData.config.channels||[]).map(c=>translateCountry(c.country)));
   const counts={};
-  nodes.forEach(n=>{if(!n)return;const country=translateCountry(n.country);if(!country||configured.has(country))return;if(!counts[country])counts[country]={total:0,available:0};counts[country].total++;if(n.active||n.probe_status==='available')counts[country].available++;});
+  nodes.forEach(n=>{if(!n)return;const country=translateCountry(n.country);if(!country)return;if(!counts[country])counts[country]={total:0,available:0};counts[country].total++;if(n.active||n.probe_status==='available')counts[country].available++;});
   return Object.entries(counts).sort((a,b)=>(b[1].available-a[1].available)||a[0].localeCompare(b[0],'zh-CN'));
 }
 function randomAvailableChannelPort(){
@@ -5686,12 +5688,15 @@ function randomAvailableChannelPort(){
 function renderAddChannelCountries(){
   const select=$("new_channel_country");if(!select)return;
   const countries=availableNewChannelCountries();
-  select.innerHTML=countries.length?countries.map(([country,count])=>`<option value="${esc(country)}" data-available="${count.available}" data-total="${count.total}">${esc(country)}（可用 ${count.available} / 共 ${count.total}）</option>`).join(''):'<option value="">节点清单中没有尚未创建出口的国家</option>';
+  select.innerHTML=countries.length?countries.map(([country,count])=>`<option value="${esc(country)}" data-available="${count.available}" data-total="${count.total}">${esc(country)}（可用 ${count.available} / 共 ${count.total}）</option>`).join(''):'<option value="">节点清单中没有候选国家</option>';
   $("new_channel_create").disabled=!countries.length;updateAddChannelCountryHint();
 }
 function updateAddChannelCountryHint(){
   const option=$("new_channel_country")?.selectedOptions?.[0];
-  const hint=$("new_channel_country_hint");if(hint)hint.textContent=option&&option.value?`创建后会先检测 ${option.value} 的全部候选节点，再按所选 IP 类型策略自动连接；当前可用 ${option.dataset.available||0} 个，共 ${option.dataset.total||0} 个候选。`:'节点清单中没有可创建的新国家出口。';
+  const protocol=$("new_channel_protocol")?.value||'hysteria';
+  const existing=(multiExitData.config.channels||[]).filter(c=>translateCountry(c.country)===option?.value).map(c=>multiProtocolLabel(c.protocol));
+  const duplicate=(multiExitData.config.channels||[]).some(c=>translateCountry(c.country)===option?.value&&(c.protocol||'hysteria')===protocol);
+  const hint=$("new_channel_country_hint");if(hint)hint.textContent=option&&option.value?`创建后会先检测 ${option.value} 的候选节点；当前可用 ${option.dataset.available||0} 个，共 ${option.dataset.total||0} 个。${existing.length?' 已有协议：'+existing.join('、')+'。':''}${duplicate?' 当前协议已存在，请选择另一协议。':''}`:'节点清单中没有可创建的国家出口。';
 }
 function openAddChannelModal(){
   $("new_channel_port").value=randomAvailableChannelPort();$("new_channel_protocol").value='hysteria';$("new_channel_ip_type").value='residential_preferred';
@@ -5703,6 +5708,7 @@ async function createMultiExitChannel(){
   const error=$("new_channel_error");const button=$("new_channel_create");
   if(!country){error.textContent='请选择一个有候选节点的国家';error.style.display='block';return;}
   if(!Number.isInteger(port)||port<1024||port>65535){error.textContent='端口必须在 1024 至 65535 之间';error.style.display='block';return;}
+  if((multiExitData.config.channels||[]).some(c=>translateCountry(c.country)===country&&(c.protocol||'hysteria')===protocol)){error.textContent=`${country} 已经存在 ${multiProtocolLabel(protocol)} 线路，请选择另一协议`;error.style.display='block';return;}
   const id=('line'+Date.now().toString(36)).slice(0,12);button.disabled=true;button.textContent='正在创建...';error.style.display='none';
   try{
     const r=await fetch('./api/update_multi_exit_channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,name:country+'线路',country,inbound_port:port,protocol,ip_type:ipType})});
@@ -7860,17 +7866,22 @@ class Handler(BaseHTTPRequestHandler):
                     is_new_channel = True
                     if len(config.get("channels", [])) >= 12:
                         raise ValueError("最多允许 12 条国家线路")
-                    if any(normalized_country_name(item.get("country")) == normalized_country_name(country) for item in config.get("channels", [])):
-                        raise ValueError("该国家已经存在独立出口")
                     index = len(config.setdefault("channels", []))
                     updated = {"id": channel_id, "enabled": True, "preferred_node_id": ""}
                     config["channels"].append(updated)
+                if any(
+                    str(item.get("id")) != channel_id
+                    and normalized_country_name(item.get("country")) == normalized_country_name(country)
+                    and str(item.get("protocol") or "hysteria").lower() == protocol
+                    for item in config.get("channels", [])
+                ):
+                    raise ValueError(f"{country} 已经存在相同协议的线路，请选择另一协议")
                 if any(str(item.get("id")) != channel_id and int(item.get("inbound_port") or 0) == port for item in config.get("channels", [])):
                     raise ValueError("该端口已被其他国家线路使用")
                 if is_new_channel or country_changed:
-                    channel_name = generated_channel_name(country, country_nodes)
+                    channel_name = generated_channel_name(country, country_nodes, protocol)
                 else:
-                    channel_name = str(updated.get("name") or payload.get("name") or country + "线路")[:30]
+                    channel_name = channel_display_name({**updated, "country": country, "protocol": protocol})
                 updated.update({
                     "id": channel_id, "name": channel_name,
                     "country": country, "inbound_port": port, "protocol": protocol,

@@ -16,8 +16,13 @@ class BootstrapTests(unittest.TestCase):
                'server_node_name': lambda name: '236.' + name}
         exec(compile(selected, 'names', 'exec'), env)
         stamp = time.mktime(time.strptime('20260905', '%Y%m%d'))
-        self.assertEqual(env['channel_display_name']({'country': '日本', 'created_at': stamp}), '236.日本-20260905')
+        self.assertEqual(env['channel_display_name']({'country': '日本', 'protocol': 'vless', 'created_at': stamp}), '236.日本-VLESS-20260905')
         self.assertIn('names[str(direct["subId"])] = server_node_name("服务器直连")', source)
+
+    def test_same_country_can_use_different_protocols(self):
+        source = (Path(__file__).resolve().parents[1] / 'vpngate_manager.py').read_text(encoding='utf-8')
+        self.assertNotIn('configured.has(country)', source)
+        self.assertIn('已经存在相同协议的线路，请选择另一协议', source)
 
     def test_fresh_direct_inbound_accepts_server_suffix_name(self):
         source = Path(__file__).resolve().parents[1] / 'xui_provision.py'
