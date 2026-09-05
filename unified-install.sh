@@ -3,10 +3,106 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 XUI_INSTALL_URL="https://raw.githubusercontent.com/MHSanaei/3x-ui/main/install.sh"
+OPEN_ALL_PORTS="${OPEN_ALL_PORTS:-1}"
 
 fail() { printf '安装失败：%s\n' "$*" >&2; exit 1; }
 random_text() { openssl rand -hex "$1"; }
 valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
+
+open_all_host_ports() {
+  printf '%s\n' '[准备] 按安装要求关闭 Ubuntu 本机防火墙并开放全部端口...'
+  if command -v ufw >/dev/null 2>&1; then
+    ufw --force disable >/dev/null 2>&1 || true
+    systemctl disable --now ufw.service >/dev/null 2>&1 || true
+  fi
+  systemctl disable --now netfilter-persistent.service >/dev/null 2>&1 || true
+  for firewall_cmd in iptables ip6tables; do
+    command -v "${firewall_cmd}" >/dev/null 2>&1 || continue
+    "${firewall_cmd}" -P INPUT ACCEPT
+    "${firewall_cmd}" -P FORWARD ACCEPT
+    "${firewall_cmd}" -P OUTPUT ACCEPT
+    "${firewall_cmd}" -F
+  done
+  DEBIAN_FRONTEND=noninteractive apt-get purge -y netfilter-persistent iptables-persistent >/dev/null 2>&1 || true
+  printf '%s\n' 'Ubuntu 本机防火墙已开放；Oracle Cloud 的 VCN/NSG 仍需在控制台单独放行。'
+}
+
+allow_local_port() {
+  local port="$1" transport="$2" description="$3"
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw allow "${port}/${transport}" comment "${description}" >/dev/null
+  fi
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -C INPUT -p "${transport}" --dport "${port}" -j ACCEPT 2>/dev/null \
+      || iptables -I INPUT 1 -p "${transport}" --dport "${port}" -j ACCEPT
+  fi
+}
+
+install_local_firewall_service() {
+  local node_transport="$1"
+  cat > /usr/local/sbin/node-gateway-open-ports <<EOF
+#!/bin/sh
+set -eu
+allow() {
+  /usr/sbin/iptables -C INPUT -p "\$2" --dport "\$1" -j ACCEPT 2>/dev/null \\
+    || /usr/sbin/iptables -I INPUT 1 -p "\$2" --dport "\$1" -j ACCEPT
+}
+allow 80 tcp
+allow 8787 tcp
+allow 2097 tcp
+allow ${panel_port} tcp
+allow ${sub_port} tcp
+allow ${node_port} ${node_transport}
+EOF
+  chmod 0755 /usr/local/sbin/node-gateway-open-ports
+  cat > /etc/systemd/system/node-gateway-firewall.service <<'EOF'
+[Unit]
+Description=Open required local ports for node gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/node-gateway-open-ports
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now node-gateway-firewall.service
+}
+
+show_available_info() {
+  printf '\n%s\n' '========== 当前可用的登录与诊断信息 =========='
+  if [[ -x /usr/local/bin/ml ]]; then
+    /usr/local/bin/ml info || true
+  elif [[ -x /usr/local/sbin/aimilivpnctl ]]; then
+    /usr/local/sbin/aimilivpnctl info || true
+  fi
+  printf '%s\n' '以后随时查询：sudo ml info'
+  printf '%s\n' '只看节点管理后台账号：sudo ml credentials'
+  printf '%s\n' '查看 3x-ui 原始设置：sudo x-ui settings'
+  printf '%s\n' '=============================================='
+}
+
+issue_missing_certificate() {
+  local cert_name="$1"
+  [[ -x /root/.acme.sh/acme.sh ]] || return 1
+  printf '%s\n' '首次证书签发未完成，已开放本机 TCP 80，正在自动重试...'
+  if [[ "${ssl_mode}" == "ip" ]]; then
+    /root/.acme.sh/acme.sh --issue -d "${cert_name}" --standalone \
+      --server letsencrypt --certificate-profile shortlived --days 6 --httpport 80 --force || return 1
+  else
+    /root/.acme.sh/acme.sh --issue -d "${cert_name}" --standalone \
+      --server letsencrypt --httpport 80 --force || return 1
+  fi
+  install -d -m 0700 "${cert_dir}"
+  /root/.acme.sh/acme.sh --install-cert -d "${cert_name}" \
+    --key-file "${cert_dir}/privkey.pem" \
+    --fullchain-file "${cert_dir}/fullchain.pem" \
+    --reloadcmd 'systemctl try-restart x-ui.service || true'
+}
 
 [[ ${EUID} -eq 0 ]] || fail "请使用 sudo bash unified-install.sh 运行"
 [[ -f "${SCRIPT_DIR}/install-core.sh" ]] || fail "安装包不完整：缺少 install-core.sh"
@@ -44,7 +140,11 @@ read -rp 'Let’s Encrypt 邮箱（可留空）: ' acme_email
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl openssl python3 cron socat
+apt-get install -y --no-install-recommends ca-certificates curl openssl python3 cron socat iptables
+
+if [[ "${OPEN_ALL_PORTS}" == "1" ]]; then
+  open_all_host_ports
+fi
 
 public_ip="$(curl -4fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
 [[ -n "${public_ip}" ]] || fail "无法识别公网 IPv4，请稍后重试"
@@ -58,8 +158,24 @@ else
   cert_dir="/root/cert/ip"
 fi
 
+printf '%s\n' '[准备] 开放安装所需的本机防火墙端口...'
+allow_local_port 80 tcp 'ACME certificate validation'
+allow_local_port 8787 tcp 'Node manager'
+allow_local_port 2097 tcp 'Combined subscriptions'
+allow_local_port "${panel_port}" tcp '3x-ui panel'
+allow_local_port "${sub_port}" tcp '3x-ui subscription'
+if [[ "${protocol}" == "hysteria" ]]; then
+  allow_local_port "${node_port}" udp 'Hysteria2 inbound'
+else
+  allow_local_port "${node_port}" tcp 'Proxy inbound'
+fi
+
 printf '%s\n' '[1/5] 安装节点出口管理系统...'
 bash "${SCRIPT_DIR}/install-core.sh"
+allow_local_port 80 tcp 'ACME certificate validation'
+allow_local_port 8787 tcp 'Node manager'
+allow_local_port 2097 tcp 'Combined subscriptions'
+install_local_firewall_service "$([[ "${protocol}" == "hysteria" ]] && echo udp || echo tcp)"
 
 printf '%s\n' '[2/5] 安装或升级 3x-ui，并申请证书...'
 if [[ ! -x /usr/local/x-ui/x-ui ]]; then
@@ -82,9 +198,21 @@ fi
 
 cert_file="${cert_dir}/fullchain.pem"
 key_file="${cert_dir}/privkey.pem"
-[[ -s "${cert_file}" && -s "${key_file}" ]] || fail "证书不存在。请确认公网 TCP 80 已放行，且域名已解析到 ${public_ip}"
+if [[ ! -s "${cert_file}" || ! -s "${key_file}" ]]; then
+  if ! issue_missing_certificate "${tls_host}"; then
+    printf '\n%s\n' '证书签发失败：服务器本机端口已经开放，但 Let’s Encrypt 仍无法从公网访问 TCP 80。' >&2
+    printf '%s\n' '请检查此实例自己的 VNIC/NSG、安全列表入站规则，以及是否确实分配了当前公网 IPv4。' >&2
+    printf '%s\n' '需要放行：来源 0.0.0.0/0，IP 协议 TCP，目标端口 80（不要只检查共用子网）。' >&2
+    show_available_info
+    exit 1
+  fi
+fi
+[[ -s "${cert_file}" && -s "${key_file}" ]] || fail "证书重试后仍未生成"
 chmod 600 "${key_file}"
 chmod 644 "${cert_file}"
+if [[ -x /usr/local/x-ui/x-ui ]]; then
+  /usr/local/x-ui/x-ui cert -webCert "${cert_file}" -webCertKey "${key_file}" >/dev/null 2>&1 || true
+fi
 
 printf '%s\n' '[3/5] 加固证书自动续签...'
 cat > /etc/systemd/system/node-gateway-cert-renew.service <<'EOF'
@@ -160,8 +288,12 @@ print('节点端口：', result['port'])
 print('通用订阅：', result['subscription'])
 print('Clash 订阅：', result['clash'])
 print('续签定时器：node-gateway-cert-renew.timer（每天自动检查）')
-print('3x-ui 面板凭据：/etc/x-ui/install-result.env（仅 root 可读）')
 PY
+
+show_available_info
 
 printf '\n请在云服务商安全组放行：TCP 80、TCP %s、TCP %s，以及节点端口 %s/%s。\n' \
   "${panel_port}" "${sub_port}" "${node_port}" "$([[ "${protocol}" == "hysteria" ]] && echo UDP || echo TCP)"
+if [[ "${OPEN_ALL_PORTS}" == "1" ]]; then
+  printf '%s\n' 'Ubuntu 本机防火墙：全部端口已开放；请使用 Oracle Cloud VCN/NSG 控制公网访问范围。'
+fi

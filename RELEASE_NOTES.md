@@ -1,3 +1,20 @@
+# open-host-firewall.33
+
+- Ubuntu/Debian 一键安装默认关闭 UFW 与 netfilter-persistent；
+- IPv4/IPv6 的 INPUT、FORWARD、OUTPUT 默认策略统一设为 ACCEPT；
+- 清空本机 filter 表规则，避免 Oracle Ubuntu 镜像规则阻止证书和管理端口；
+- 可在运行安装器前设置 `OPEN_ALL_PORTS=0` 保留本机防火墙；
+- 明确提示 Oracle Cloud VCN、安全列表和 NSG 仍需在云控制台配置。
+
+# installer-certificate.32
+
+- 在申请证书前开放服务器本机所需 TCP/UDP 端口；
+- 3x-ui 首次申请证书失败后自动进行第二次签发；
+- 区分“本机端口已开放”和“Oracle Cloud 公网入口不可达”，提供准确提示；
+- 修复 `sudo ml credentials` 的命令语法错误；
+- 新增 `sudo ml info`，集中显示两个后台、订阅、证书与服务状态；
+- 安装成功或证书中断时均在终端末尾显示当前可用登录信息。
+
 # stability.31
 
 本版本首次把当前定制的多国家独立出口系统完整发布到一键安装仓库，并加入低内存稳定性修复。

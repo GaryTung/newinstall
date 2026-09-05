@@ -4,6 +4,73 @@ set -euo pipefail
 service_name="aimilivpn.service"
 data_dir="/var/lib/aimilivpn"
 
+show_info() {
+  python3 - "${data_dir}/ui_auth.json" <<'PY'
+import json, sys, urllib.request
+from pathlib import Path
+
+cfg = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+try:
+    public_ip = urllib.request.urlopen("https://api.ipify.org", timeout=5).read().decode().strip()
+except Exception:
+    public_ip = "<服务器公网IP>"
+secret_path = str(cfg.get("secret_path", "")).strip("/")
+port = int(cfg.get("port", 8787))
+print("\n===== 节点管理后台 =====")
+print(f"地址：http://{public_ip}:{port}/{secret_path}/")
+print(f"账号：{cfg.get('username', '')}")
+print(f"密码：{cfg.get('password', '')}")
+PY
+
+  if [[ -r /etc/x-ui/install-result.env ]]; then
+    # shellcheck disable=SC1091
+    . /etc/x-ui/install-result.env
+    printf '\n%s\n' '===== 3x-ui 面板 ====='
+    printf '地址：%s\n' "${XUI_ACCESS_URL:-未生成}"
+    printf '账号：%s\n' "${XUI_USERNAME:-未生成}"
+    printf '密码：%s\n' "${XUI_PASSWORD:-未生成}"
+  else
+    printf '\n%s\n' '===== 3x-ui 面板 ====='
+    printf '%s\n' '凭据文件尚未生成：/etc/x-ui/install-result.env'
+  fi
+
+  if [[ -r /etc/x-ui/gateway-result.json ]]; then
+    python3 - <<'PY'
+import json
+from pathlib import Path
+
+result = json.loads(Path('/etc/x-ui/gateway-result.json').read_text(encoding='utf-8'))
+print("\n===== 节点与订阅 =====")
+print(f"协议：{result.get('protocol', '')}")
+print(f"节点端口：{result.get('port', '')}")
+print(f"通用订阅：{result.get('subscription', '')}")
+print(f"Clash/Mihomo：{result.get('clash', '')}")
+PY
+  else
+    printf '\n%s\n' '===== 节点与订阅 ====='
+    printf '%s\n' '尚未生成；请修复证书后重新执行一键安装命令。'
+  fi
+
+  printf '\n%s\n' '===== 运行状态 ====='
+  for unit in aimilivpn aimilivpn-multiexit x-ui nginx; do
+    if systemctl list-unit-files "${unit}.service" --no-legend 2>/dev/null | grep -q .; then
+      printf '%-24s %s\n' "${unit}" "$(systemctl is-active "${unit}.service" 2>/dev/null || true)"
+    fi
+  done
+  if [[ -s /root/cert/ip/fullchain.pem ]]; then
+    printf 'IP证书：有效（'
+    openssl x509 -in /root/cert/ip/fullchain.pem -noout -enddate 2>/dev/null | sed 's/^notAfter=//'
+    printf '%s\n' '）'
+  elif compgen -G '/root/cert/*/fullchain.pem' >/dev/null; then
+    cert_file="$(find /root/cert -mindepth 2 -maxdepth 2 -name fullchain.pem -type f | head -n 1)"
+    printf 'TLS证书：有效（'
+    openssl x509 -in "${cert_file}" -noout -enddate 2>/dev/null | sed 's/^notAfter=//'
+    printf '%s\n' '）'
+  else
+    printf '%s\n' 'TLS证书：尚未签发'
+  fi
+}
+
 case "${1:-status}" in
   status)
     systemctl status "${service_name}" --no-pager
@@ -30,7 +97,7 @@ case "${1:-status}" in
       exit 1
     fi
     ;;
-+  credentials)
+  credentials)
     python3 - "${data_dir}/ui_auth.json" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as f:
@@ -41,8 +108,11 @@ print(f"端口：{cfg.get('port', 8787)}")
 print(f"路径：/{cfg.get('secret_path', '')}/")
 PY
     ;;
+  info)
+    show_info
+    ;;
   *)
-    printf '%s\n' '用法：sudo ml {status|start|stop|restart|logs|channels|credentials}' >&2
+    printf '%s\n' '用法：sudo ml {info|credentials|status|start|stop|restart|logs|channels}' >&2
     exit 2
     ;;
 esac

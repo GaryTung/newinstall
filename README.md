@@ -12,6 +12,8 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/GaryTung/newinstall
 
 安装向导会要求选择初始协议和端口，并可选择使用域名证书或公网 IPv4证书。
 
+默认会关闭 Ubuntu 本机的 UFW/netfilter-persistent，并开放本机全部 TCP/UDP 端口，公网访问范围由 Oracle Cloud 的 VCN/安全列表/NSG 控制。如需保留本机防火墙，可在下载安装包后以 `OPEN_ALL_PORTS=0` 运行安装器。
+
 ## 主要功能
 
 - VPS直连节点与多国家独立出口同时存在；
@@ -61,12 +63,15 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/GaryTung/newinstall
 ## 管理命令
 
 ```bash
+sudo ml info
 sudo ml status
 sudo ml credentials
 sudo ml channels
 sudo ml logs
 sudo ml restart
 ```
+
+`sudo ml info` 会集中显示节点管理后台、3x-ui 面板、订阅地址、证书状态和各服务状态。安装成功后也会在终端末尾自动再次显示这些信息。
 
 ## 升级
 

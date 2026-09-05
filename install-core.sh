@@ -178,5 +178,6 @@ printf '管理地址：http://%s:%s/%s/\n' "${public_ip}" "${login_info[3]}" "${
 printf '管理账号：%s\n' "${login_info[0]}"
 printf '管理密码：%s\n' "${login_info[1]}"
 printf '本机代理：http/socks5://127.0.0.1:%s\n' "${PROXY_PORT}"
+printf '%s\n' '完整登录信息：sudo ml info'
 printf '%s\n' '管理命令：sudo ml status | credentials | logs | restart'
 printf '请在云服务商安全组中放行 TCP %s（后台）及 TCP 2097（总订阅）；不要向公网开放代理端口 %s。\n' "${login_info[3]}" "${PROXY_PORT}"

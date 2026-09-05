@@ -73,6 +73,34 @@ class Stability31PackageTests(unittest.TestCase):
         self.assertIn('(\"insecure\", \"0\")', manager)
         self.assertIn("skip-cert-verify: false", manager)
 
+    def test_installer_certificate_recovery_and_info_command(self) -> None:
+        unified = (ROOT / "unified-install.sh").read_text(encoding="utf-8")
+        control = (ROOT / "aimilivpnctl").read_text(encoding="utf-8")
+        for marker in (
+            "allow_local_port 80 tcp",
+            "node-gateway-firewall.service",
+            "issue_missing_certificate",
+            "--certificate-profile shortlived",
+            "show_available_info",
+        ):
+            self.assertIn(marker, unified)
+        self.assertIn("  credentials)", control)
+        self.assertNotIn("+  credentials)", control)
+        self.assertIn("  info)", control)
+        self.assertIn("XUI_ACCESS_URL", control)
+        self.assertIn("gateway-result.json", control)
+
+    def test_host_firewall_is_opened_by_default(self) -> None:
+        unified = (ROOT / "unified-install.sh").read_text(encoding="utf-8")
+        for marker in (
+            'OPEN_ALL_PORTS="${OPEN_ALL_PORTS:-1}"',
+            "open_all_host_ports",
+            '"${firewall_cmd}" -P INPUT ACCEPT',
+            'iptables-persistent',
+            'ufw --force disable',
+        ):
+            self.assertIn(marker, unified)
+
     def test_repository_contains_no_runtime_credentials(self) -> None:
         forbidden_paths = (
             ROOT / "vpngate_data",
