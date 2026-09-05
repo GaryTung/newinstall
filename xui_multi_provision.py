@@ -141,7 +141,8 @@ def source_inbound(db):
     row = db.execute(
         """select * from inbounds
         where protocol in ('vless','trojan','hysteria') and remark not like 'COUNTRY:%'
-        order by case when remark in ('AUTO-GATEWAY','VPS-DIRECT','服务器直连') then 0 else 1 end, id limit 1"""
+        order by case when remark in ('AUTO-GATEWAY','VPS-DIRECT','服务器直连')
+            or remark like '%.服务器直连' then 0 else 1 end, id limit 1"""
     ).fetchone()
     if not row:
         raise RuntimeError("未找到可复制的 VLESS、Trojan 或 Hysteria2 入站")
@@ -281,6 +282,9 @@ def main():
             raise RuntimeError("直连节点协议必须是 vless、trojan 或 hysteria")
         source_stream = load_json(source["stream_settings"], {})
         source_settings = load_json(source["settings"], {})
+        direct_name = str(source.get("remark") or "服务器直连")
+        if not (direct_name == "服务器直连" or direct_name.endswith(".服务器直连")):
+            direct_name = "服务器直连"
         source_client = (source_settings.get("clients") or [None])[0]
         direct_client = source_client
         direct_tag = old_direct_tag
@@ -289,8 +293,8 @@ def main():
             direct_tag = f"in-{source['port']}-{'udp' if direct_protocol == 'hysteria' else 'tcp'}"
             remove_normalized_client(db, source["id"])
             db.execute(
-                "update inbounds set remark='服务器直连',protocol=?,tag=?,settings=?,stream_settings=? where id=?",
-                (direct_protocol, direct_tag, compact(protocol_settings(direct_protocol, direct_client)),
+                "update inbounds set remark=?,protocol=?,tag=?,settings=?,stream_settings=? where id=?",
+                (direct_name, direct_protocol, direct_tag, compact(protocol_settings(direct_protocol, direct_client)),
                  compact(protocol_stream(source_stream, direct_protocol, direct_client)), source["id"]),
             )
             insert_normalized_client(db, source["id"], direct_client)
@@ -361,7 +365,7 @@ def main():
     output = {
         "backup": str(backup),
         "direct": {
-            "name": "服务器直连",
+            "name": direct_name,
             "port": source["port"],
             "protocol": direct_protocol,
             "subId": direct_client.get("subId"),

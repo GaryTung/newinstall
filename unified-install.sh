@@ -172,6 +172,8 @@ fi
 
 printf '%s\n' '[1/5] 安装节点出口管理系统...'
 bash "${SCRIPT_DIR}/install-core.sh"
+printf '%s\n' "${public_ip}" > /var/lib/aimilivpn/public_ip.txt
+chmod 0644 /var/lib/aimilivpn/public_ip.txt
 allow_local_port 80 tcp 'ACME certificate validation'
 allow_local_port 8787 tcp 'Node manager'
 allow_local_port 2097 tcp 'Combined subscriptions'
@@ -248,6 +250,7 @@ result_json="$(/usr/local/sbin/node-gateway-provision \
   --protocol "${protocol}" \
   --port "${node_port}" \
   --host "${tls_host}" \
+  --server-ip "${public_ip}" \
   --cert "${cert_file}" \
   --key "${key_file}" \
   --proxy-port "${PROXY_PORT:-7928}" \

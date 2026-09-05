@@ -76,7 +76,7 @@ def tls_stream(cert_file, key_file, server_name):
     }
 
 
-def make_inbound(protocol, port, cert_file, key_file, server_name):
+def make_inbound(protocol, port, cert_file, key_file, server_name, display_name="服务器直连"):
     client_id = str(uuid.uuid4())
     password = secrets.token_urlsafe(18)
     sub_id = secrets.token_urlsafe(12)
@@ -124,7 +124,7 @@ def make_inbound(protocol, port, cert_file, key_file, server_name):
         "up": 0,
         "down": 0,
         "total": 0,
-        "remark": "服务器直连",
+        "remark": display_name,
         "sub_sort_index": 1,
         "enable": 1,
         "expiry_time": 0,
@@ -171,6 +171,7 @@ def main():
     parser.add_argument("--protocol", choices=("vless", "trojan", "hysteria"), required=True)
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--host", required=True)
+    parser.add_argument("--server-ip", default="")
     parser.add_argument("--cert", required=True)
     parser.add_argument("--key", required=True)
     parser.add_argument("--proxy-port", type=int, default=7928)
@@ -190,21 +191,33 @@ def main():
     db = sqlite3.connect(database)
     db.row_factory = sqlite3.Row
     try:
+        server_ip = args.server_ip.strip()
+        parts = server_ip.split(".")
+        suffix = parts[-1] if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts) else ""
+        direct_name = f"{suffix}.服务器直连" if suffix else "服务器直连"
         inbound, sub_id, tag = make_inbound(
-            args.protocol, args.port, args.cert, args.key, args.host
+            args.protocol, args.port, args.cert, args.key, args.host, direct_name
         )
         conflict = db.execute(
-            "select id,remark from inbounds where port=? and remark not in ('AUTO-GATEWAY','VPS-DIRECT','服务器直连')", (args.port,)
+            """select id,remark from inbounds where port=?
+            and remark not in ('AUTO-GATEWAY','VPS-DIRECT','服务器直连')
+            and remark not like '%.服务器直连'""", (args.port,)
         ).fetchone()
         if conflict:
             raise RuntimeError(f"端口 {args.port} 已被入站 {conflict['remark']} 使用")
-        old_ids = [r[0] for r in db.execute("select id from inbounds where remark in ('AUTO-GATEWAY','VPS-DIRECT','服务器直连')")]
+        old_ids = [r[0] for r in db.execute(
+            """select id from inbounds where remark in ('AUTO-GATEWAY','VPS-DIRECT','服务器直连')
+            or remark like '%.服务器直连'"""
+        )]
         for old_id in old_ids:
             linked = [r[0] for r in db.execute("select client_id from client_inbounds where inbound_id=?", (old_id,))]
             db.execute("delete from client_inbounds where inbound_id=?", (old_id,))
             for client_row_id in linked:
                 db.execute("delete from clients where id=? and not exists (select 1 from client_inbounds where client_id=?)", (client_row_id, client_row_id))
-        db.execute("delete from inbounds where remark in ('AUTO-GATEWAY','VPS-DIRECT','服务器直连')")
+        db.execute(
+            """delete from inbounds where remark in ('AUTO-GATEWAY','VPS-DIRECT','服务器直连')
+            or remark like '%.服务器直连'"""
+        )
         columns = [r[1] for r in db.execute("pragma table_info(inbounds)")]
         names = [name for name in inbound if name in columns]
         placeholders = ",".join("?" for _ in names)

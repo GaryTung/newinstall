@@ -265,7 +265,8 @@ def get_direct_node_status() -> dict[str, Any]:
             """select remark,port,protocol,tag from inbounds
             where enable=1 and protocol in ('vless','trojan','hysteria')
             and remark not like 'COUNTRY:%'
-            order by case when remark in ('AUTO-GATEWAY','VPS-DIRECT') then 0 else 1 end,id limit 1"""
+            order by case when remark in ('AUTO-GATEWAY','VPS-DIRECT','服务器直连')
+                or remark like '%.服务器直连' then 0 else 1 end,id limit 1"""
         ).fetchone()
         setting = db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()
         db.close()
@@ -295,6 +296,30 @@ def get_direct_node_status() -> dict[str, Any]:
     return result
 
 
+def server_node_prefix() -> str:
+    """Return the last octet of this server's public IPv4 for client node names."""
+    candidates = [str(_direct_ip_cache.get("value") or "").strip()]
+    try:
+        candidates.append((DATA_DIR / "public_ip.txt").read_text(encoding="utf-8").strip())
+    except OSError:
+        pass
+    candidates.append(str(xui_subscription_settings().get("subDomain") or "").strip())
+    for value in candidates:
+        parts = value.split(".")
+        if len(parts) == 4 and all(part.isdigit() and 0 <= int(part) <= 255 for part in parts):
+            return parts[-1]
+    direct_ip = str(get_direct_node_status().get("exit_ip") or "").strip()
+    parts = direct_ip.split(".")
+    if len(parts) == 4 and all(part.isdigit() and 0 <= int(part) <= 255 for part in parts):
+        return parts[-1]
+    return ""
+
+
+def server_node_name(base_name: str) -> str:
+    prefix = server_node_prefix()
+    return f"{prefix}.{base_name}" if prefix else base_name
+
+
 MULTI_EXIT_DIR = Path("/var/lib/aimilivpn-multiexit")
 MULTI_EXIT_DEEP_FAILURES_FILE = MULTI_EXIT_DIR / "deep_failures.json"
 MULTI_EXIT_VERIFIED_EXITS_FILE = MULTI_EXIT_DIR / "verified_exits.json"
@@ -308,19 +333,24 @@ def read_multi_exit_config() -> dict[str, Any]:
 
 def migrate_xui_direct_display_name() -> None:
     """Rename an existing direct inbound without changing its port or credentials."""
+    display_name = server_node_name("服务器直连")
     database = Path("/etc/x-ui/x-ui.db")
     if database.exists():
         try:
             db = sqlite3.connect(database, timeout=5)
-            db.execute("update inbounds set remark='服务器直连' where remark in ('VPS-DIRECT','AUTO-GATEWAY')")
+            db.execute(
+                """update inbounds set remark=? where remark in ('VPS-DIRECT','AUTO-GATEWAY','服务器直连')
+                or remark like '%.服务器直连'""",
+                (display_name,),
+            )
             db.commit()
             db.close()
         except Exception as exc:
             print(f"[name migration] direct inbound rename deferred: {exc}", flush=True)
     result_file = Path("/etc/x-ui/multi-exit-result.json")
     result = read_json(result_file, {})
-    if isinstance(result.get("direct"), dict) and result["direct"].get("name") != "服务器直连":
-        result["direct"]["name"] = "服务器直连"
+    if isinstance(result.get("direct"), dict) and result["direct"].get("name") != display_name:
+        result["direct"]["name"] = display_name
         write_json(result_file, result)
 
 
@@ -511,7 +541,7 @@ def provisioned_subscription_names() -> dict[str, str]:
     names: dict[str, str] = {}
     direct = result.get("direct") or {}
     if direct.get("subId"):
-        names[str(direct["subId"])] = "服务器直连"
+        names[str(direct["subId"])] = server_node_name("服务器直连")
     for item in result.get("channels", []):
         sub_id = str(item.get("subId") or "")
         if sub_id:
@@ -2385,10 +2415,10 @@ COUNTRY_DISPLAY_NAMES = {
 
 
 def channel_display_name(channel: dict[str, Any]) -> str:
-    """Return the user-facing Chinese country name and its creation date."""
+    """Return server suffix, Chinese country name and its creation date."""
     country = normalized_country_name(channel.get("country")) or "国家"
     created_at = float(channel.get("created_at") or time.time())
-    return f"{country}-{time.strftime('%Y%m%d', time.localtime(created_at))}"
+    return server_node_name(f"{country}-{time.strftime('%Y%m%d', time.localtime(created_at))}")
 
 
 def generated_channel_name(country: Any, country_nodes: list[dict[str, Any]]) -> str:

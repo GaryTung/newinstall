@@ -1,4 +1,5 @@
 import ast
+import importlib.util
 import threading
 import time
 import unittest
@@ -11,11 +12,22 @@ class BootstrapTests(unittest.TestCase):
         tree = ast.parse(source)
         names = {'normalized_country_name', 'channel_display_name'}
         selected = ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names], type_ignores=[])
-        env = {'Any': object, 'time': time, 'vpn_utils': type('V', (), {'COUNTRY_TRANSLATIONS': {}})}
+        env = {'Any': object, 'time': time, 'vpn_utils': type('V', (), {'COUNTRY_TRANSLATIONS': {}}),
+               'server_node_name': lambda name: '236.' + name}
         exec(compile(selected, 'names', 'exec'), env)
         stamp = time.mktime(time.strptime('20260905', '%Y%m%d'))
-        self.assertEqual(env['channel_display_name']({'country': '日本', 'created_at': stamp}), '日本-20260905')
-        self.assertIn('names[str(direct["subId"])] = "服务器直连"', source)
+        self.assertEqual(env['channel_display_name']({'country': '日本', 'created_at': stamp}), '236.日本-20260905')
+        self.assertIn('names[str(direct["subId"])] = server_node_name("服务器直连")', source)
+
+    def test_fresh_direct_inbound_accepts_server_suffix_name(self):
+        source = Path(__file__).resolve().parents[1] / 'xui_provision.py'
+        spec = importlib.util.spec_from_file_location('xui_provision_for_name_test', source)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        inbound, _, _ = module.make_inbound(
+            'vless', 24129, '/cert.pem', '/key.pem', '161.33.194.236', '236.服务器直连'
+        )
+        self.assertEqual(inbound['remark'], '236.服务器直连')
     def test_late_channel_discovered_and_no_duplicate_workers(self):
         source = Path(__file__).resolve().parents[1] / 'vpngate_manager.py'
         tree = ast.parse(source.read_text(encoding='utf-8'))
