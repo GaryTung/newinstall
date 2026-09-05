@@ -77,6 +77,8 @@ sudo ml restart
 
 重新执行一行安装命令。安装器会在替换程序前备份旧版本，并保留后台账号、节点数据、国家通道和3x-ui数据库。
 
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/GaryTung/newinstall/main/upgrade-dashboard.sh)"
+
 ## 安全提示
 
 订阅链接相当于访问凭据，请勿公开分享。本仓库不包含任何 VPS私钥、后台密码、订阅密钥、节点缓存或运行日志。
