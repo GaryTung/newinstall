@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+service_name="aimilivpn.service"
+data_dir="/var/lib/aimilivpn"
+
+case "${1:-status}" in
+  status)
+    systemctl status "${service_name}" --no-pager
+    ;;
+  restart)
+    systemctl restart "${service_name}"
+    systemctl is-active "${service_name}"
+    ;;
+  stop)
+    systemctl stop "${service_name}"
+    ;;
+  start)
+    systemctl start "${service_name}"
+    systemctl is-active "${service_name}"
+    ;;
+  logs)
+    journalctl -u "${service_name}" -n 200 -f
+    ;;
+  channels)
+    if [[ -x /usr/local/sbin/aimilivpn-multiexit ]]; then
+      /usr/local/sbin/aimilivpn-multiexit status
+    else
+      printf '%s\n' '多国家出口尚未安装' >&2
+      exit 1
+    fi
+    ;;
++  credentials)
+    python3 - "${data_dir}/ui_auth.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    cfg = json.load(f)
+print(f"账号：{cfg.get('username', '')}")
+print(f"密码：{cfg.get('password', '')}")
+print(f"端口：{cfg.get('port', 8787)}")
+print(f"路径：/{cfg.get('secret_path', '')}/")
+PY
+    ;;
+  *)
+    printf '%s\n' '用法：sudo ml {status|start|stop|restart|logs|channels|credentials}' >&2
+    exit 2
+    ;;
+esac

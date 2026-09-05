@@ -1,32 +1,77 @@
-Ubuntu 24系统安装命令，默认登录用户 ubuntu 并不是 root；通过 sudo bash 可以直接获得安装所需权限。
+# 多国家独立出口节点管理系统
+
+适用于 Ubuntu 22.04/24.04、Debian 12。安装器会部署节点管理后台、3x-ui、TLS证书、订阅和多国家独立 VPNGate出口。
+
+## 一行安装
+
+请先在云安全组放行 TCP 22、80、443。然后使用 root执行：
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/GaryTung/newinstall/main/install.sh | sudo bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/GaryTung/newinstall/main/install.sh)"
 ```
 
-自定义端口安装
-例如管理端口改为 18877，本机代理端口改为 17928：
+安装向导会要求选择初始协议和端口，并可选择使用域名证书或公网 IPv4证书。
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/GaryTung/newinstall/main/install.sh | sudo env UI_PORT=18877 PROXY_PORT=17928 bash
-```
+## 主要功能
 
-安装后操作
-安装完成后终端会显示：
-管理后台地址
-随机管理账号
-随机管理密码
-随机隐藏路径
-本机代理端口
+- VPS直连节点与多国家独立出口同时存在；
+- 每个国家可独立选择 VLESS、Trojan 或 Hysteria2；
+- 每个国家使用独立端口、网络命名空间、OpenVPN和出口；
+- 严格锁定国家，不会在目标国家失败时跳到其他国家；
+- 支持住宅优先、仅住宅、仅机房或全部IP；
+- 支持添加、删除、保存和手动切换单个国家线路；
+- 提供单节点链接及包含全部国家线路的总订阅；
+- 提供通用订阅和 Clash/Mihomo订阅；
+- 自动申请并续签 TLS证书；
+- 节点目录更新与各国家可用性检测相互独立；
+- 低内存检测、热备用和失败自动恢复。
 
-管理命令：
+## stability.31 稳定性规则
+
+- “OpenVPN握手成功”不再等同于“完整出口已验证”；
+- 连接成功后记录真实出口、国家、服务商和IP类型；
+- 最近20分钟完成完整出口验证的节点优先作为备用；
+- 当前出口健康检测使用三个独立公网地址服务容错；
+- 单个地址服务临时故障不会立即触发线路切换；
+- 自动连接最多尝试8个符合策略的同国家候选节点；
+- OpenVPN连接超时缩短到20秒，减少失效节点拖延；
+- 自动清理超过90秒的遗留测试进程；
+- 批量检测降低节点文件写入频率，减少一核低内存VPS卡死概率。
+
+## 默认国家线路
+
+- `7825`：美国，Hysteria2，住宅优先；
+- `7866`：日本，Trojan，全部IP（排除 KDDI/AS2516）；
+- `7888`：韩国，VLESS，全部IP（排除 KT/AS4766）。
+
+后台可以修改或删除默认线路，也可以从节点国家清单新增其他国家。
+
+## 防火墙
+
+除 SSH、HTTP和HTTPS外，还需要在云安全组中放行：
+
+- 后台管理端口，默认 TCP `8787`；
+- 3x-ui面板端口，安装时指定；
+- 总订阅端口，默认 TCP `2096`/`2097`；
+- VLESS/Trojan节点使用对应 TCP端口；
+- Hysteria2节点使用对应 UDP端口。
+
+不要向公网开放内部代理端口 `7928` 或各网络命名空间的 SOCKS端口。
+
+## 管理命令
+
 ```bash
 sudo ml status
 sudo ml credentials
-sudo ml restart
+sudo ml channels
 sudo ml logs
+sudo ml restart
 ```
 
-还需要在安全列表中放行管理端口，例如：
-协议：TCP
-目标端口：8787
-来源：建议仅填写你自己的公网 IP
+## 升级
+
+重新执行一行安装命令。安装器会在替换程序前备份旧版本，并保留后台账号、节点数据、国家通道和3x-ui数据库。
+
+## 安全提示
+
+订阅链接相当于访问凭据，请勿公开分享。本仓库不包含任何 VPS私钥、后台密码、订阅密钥、节点缓存或运行日志。

@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
+*.bak
+*.orig
+*.key
+*.pem
+.env
+vpngate_data/
+ui_auth.json
+vpngate_auth.txt
+upstream_proxy_auth.txt
+dist/
+build/
