@@ -5689,7 +5689,38 @@ async function monitorChannelAvailability(id,startedAt){
 async function switchMultiExitNode(id){
   const card=channelCard(id);const selected=card&&card.querySelector(`input[name="candidate-${CSS.escape(id)}"]:checked`);if(!selected){channelMessage(id,'请先选择一个候选 IP');return;}channelMessage(id,'正在切换当前国家出口...');try{const r=await fetch('./api/switch_multi_exit_node',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel_id:id,node_id:selected.value})});const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'切换失败');channelMessage(id,d.message);setTimeout(loadMultiExit,3000);}catch(e){channelMessage(id,e.message);}
 }
-async function copyText(value){try{await navigator.clipboard.writeText(value);}catch(e){window.prompt('复制链接',value);}}
+let copyNoticeTimer;
+function showCopyNotice(message, success){
+  let notice=document.getElementById('copy-notice');
+  if(!notice){
+    notice=document.createElement('div');notice.id='copy-notice';
+    notice.setAttribute('role','status');notice.setAttribute('aria-live','polite');
+    notice.style.cssText='position:fixed;bottom:28px;left:50%;transform:translateX(-50%);z-index:100000;padding:12px 20px;border-radius:12px;color:white;box-shadow:0 8px 30px #0005;max-width:90vw;font-size:14px;pointer-events:none;text-align:center';
+    document.body.appendChild(notice);
+  }
+  notice.textContent=message;notice.style.background=success?'#047857':'#92400e';notice.hidden=false;
+  clearTimeout(copyNoticeTimer);copyNoticeTimer=setTimeout(()=>{notice.hidden=true;},3500);
+}
+function copyTextFallback(value){
+  const previous=document.activeElement;
+  const input=document.createElement('textarea');input.value=value;input.readOnly=true;
+  input.style.cssText='position:fixed;left:-9999px;top:0;font-size:16px';
+  document.body.appendChild(input);
+  try{input.focus({preventScroll:true});input.select();input.setSelectionRange(0,input.value.length);return document.execCommand('copy')===true;}
+  catch(e){return false;}
+  finally{input.remove();if(previous&&previous.focus)previous.focus({preventScroll:true});}
+}
+async function copyText(value){
+  if(!value){showCopyNotice('链接尚未生成，请稍后再试',false);return;}
+  let copied=false;
+  if(window.isSecureContext&&navigator.clipboard&&navigator.clipboard.writeText){
+    try{await navigator.clipboard.writeText(value);copied=true;}catch(e){}
+  }
+  if(!copied)copied=copyTextFallback(value);
+  if(copied){showCopyNotice('已复制到剪贴板',true);return;}
+  window.prompt('浏览器禁止自动复制，请手动复制以下内容',value);
+  showCopyNotice('未能自动复制，请手动复制',false);
+}
 function copyDirectNode(kind){copyText((multiExitData.direct||{})[kind]||'');}
 function copyChannelNode(id,kind){const item=(multiExitData.config.channels||[]).find(c=>c.id===id);copyText((item||{})[kind]||'');}
 function copyBundleSubscription(kind){copyText((multiExitData.bundle||{})[kind]||'');}
