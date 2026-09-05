@@ -1,10 +1,21 @@
 import ast
 import threading
+import time
 import unittest
 from pathlib import Path
 
 
 class BootstrapTests(unittest.TestCase):
+    def test_node_display_names_are_chinese_country_and_creation_date(self):
+        source = (Path(__file__).resolve().parents[1] / 'vpngate_manager.py').read_text(encoding='utf-8')
+        tree = ast.parse(source)
+        names = {'normalized_country_name', 'channel_display_name'}
+        selected = ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names], type_ignores=[])
+        env = {'Any': object, 'time': time, 'vpn_utils': type('V', (), {'COUNTRY_TRANSLATIONS': {}})}
+        exec(compile(selected, 'names', 'exec'), env)
+        stamp = time.mktime(time.strptime('20260905', '%Y%m%d'))
+        self.assertEqual(env['channel_display_name']({'country': '日本', 'created_at': stamp}), '日本-20260905')
+        self.assertIn('names[str(direct["subId"])] = "服务器直连"', source)
     def test_late_channel_discovered_and_no_duplicate_workers(self):
         source = Path(__file__).resolve().parents[1] / 'vpngate_manager.py'
         tree = ast.parse(source.read_text(encoding='utf-8'))

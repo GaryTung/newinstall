@@ -306,6 +306,24 @@ def read_multi_exit_config() -> dict[str, Any]:
     return read_json(MULTI_EXIT_DIR / "channels.json", {"version": 2, "direct_protocol": "hysteria", "channels": []})
 
 
+def migrate_xui_direct_display_name() -> None:
+    """Rename an existing direct inbound without changing its port or credentials."""
+    database = Path("/etc/x-ui/x-ui.db")
+    if database.exists():
+        try:
+            db = sqlite3.connect(database, timeout=5)
+            db.execute("update inbounds set remark='服务器直连' where remark in ('VPS-DIRECT','AUTO-GATEWAY')")
+            db.commit()
+            db.close()
+        except Exception as exc:
+            print(f"[name migration] direct inbound rename deferred: {exc}", flush=True)
+    result_file = Path("/etc/x-ui/multi-exit-result.json")
+    result = read_json(result_file, {})
+    if isinstance(result.get("direct"), dict) and result["direct"].get("name") != "服务器直连":
+        result["direct"]["name"] = "服务器直连"
+        write_json(result_file, result)
+
+
 def xui_subscription_settings() -> dict[str, str]:
     database = Path("/etc/x-ui/x-ui.db")
     if not database.exists():
@@ -489,11 +507,11 @@ def provisioned_subscription_ids() -> list[str]:
 def provisioned_subscription_names() -> dict[str, str]:
     result = read_json(Path("/etc/x-ui/multi-exit-result.json"), {"channels": []})
     config = read_multi_exit_config()
-    channel_names = {str(c.get("id") or ""): str(c.get("name") or "") for c in config.get("channels", [])}
+    channel_names = {str(c.get("id") or ""): channel_display_name(c) for c in config.get("channels", [])}
     names: dict[str, str] = {}
     direct = result.get("direct") or {}
     if direct.get("subId"):
-        names[str(direct["subId"])] = str(direct.get("name") or "VPS-Direct")
+        names[str(direct["subId"])] = "服务器直连"
     for item in result.get("channels", []):
         sub_id = str(item.get("subId") or "")
         if sub_id:
@@ -963,6 +981,20 @@ def migrate_multi_exit_channels() -> None:
         config = read_multi_exit_config()
         changed = False
         for channel in config.get("channels", []):
+            if not float(channel.get("created_at") or 0):
+                date_match = re.search(r"(20\d{6})", str(channel.get("name") or ""))
+                if date_match:
+                    try:
+                        channel["created_at"] = time.mktime(time.strptime(date_match.group(1), "%Y%m%d"))
+                    except ValueError:
+                        channel["created_at"] = time.time()
+                else:
+                    channel["created_at"] = time.time()
+                changed = True
+            expected_name = channel_display_name(channel)
+            if channel.get("name") != expected_name:
+                channel["name"] = expected_name
+                changed = True
             if channel.get("tested_only") is not True:
                 channel["tested_only"] = True
                 changed = True
@@ -2352,18 +2384,16 @@ COUNTRY_DISPLAY_NAMES = {
 }
 
 
+def channel_display_name(channel: dict[str, Any]) -> str:
+    """Return the user-facing Chinese country name and its creation date."""
+    country = normalized_country_name(channel.get("country")) or "国家"
+    created_at = float(channel.get("created_at") or time.time())
+    return f"{country}-{time.strftime('%Y%m%d', time.localtime(created_at))}"
+
+
 def generated_channel_name(country: Any, country_nodes: list[dict[str, Any]]) -> str:
-    """Return a stable, client-friendly English country name plus creation date."""
-    country_code = next((
-        str(node.get("country_short") or node.get("CountryShort") or "").upper()
-        for node in country_nodes
-        if len(str(node.get("country_short") or node.get("CountryShort") or "")) == 2
-    ), "")
-    display = COUNTRY_DISPLAY_NAMES.get(country_code, "")
-    if not display:
-        ascii_country = re.sub(r"[^A-Za-z0-9]", "", str(country or ""))
-        display = ascii_country or country_code or "Country"
-    return f"{display}-{time.strftime('%Y%m%d')}"
+    """Return a Chinese country name plus today's creation date."""
+    return channel_display_name({"country": country, "created_at": time.time()})
 
 
 def normalize_node_country_catalog() -> int:
@@ -8493,6 +8523,7 @@ def main() -> None:
         except Exception as exc:
             print(f"[启动恢复] 本地节点缓存恢复失败: {exc}", flush=True)
 
+    migrate_xui_direct_display_name()
     migrate_multi_exit_channels()
     threading.Thread(target=collector_loop, daemon=True).start()
     threading.Thread(target=bootstrap_supervisor_loop, daemon=True).start()

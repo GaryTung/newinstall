@@ -124,7 +124,7 @@ def make_inbound(protocol, port, cert_file, key_file, server_name):
         "up": 0,
         "down": 0,
         "total": 0,
-        "remark": "VPS-DIRECT",
+        "remark": "服务器直连",
         "sub_sort_index": 1,
         "enable": 1,
         "expiry_time": 0,
@@ -194,17 +194,17 @@ def main():
             args.protocol, args.port, args.cert, args.key, args.host
         )
         conflict = db.execute(
-            "select id,remark from inbounds where port=? and remark not in ('AUTO-GATEWAY','VPS-DIRECT')", (args.port,)
+            "select id,remark from inbounds where port=? and remark not in ('AUTO-GATEWAY','VPS-DIRECT','服务器直连')", (args.port,)
         ).fetchone()
         if conflict:
             raise RuntimeError(f"端口 {args.port} 已被入站 {conflict['remark']} 使用")
-        old_ids = [r[0] for r in db.execute("select id from inbounds where remark in ('AUTO-GATEWAY','VPS-DIRECT')")]
+        old_ids = [r[0] for r in db.execute("select id from inbounds where remark in ('AUTO-GATEWAY','VPS-DIRECT','服务器直连')")]
         for old_id in old_ids:
             linked = [r[0] for r in db.execute("select client_id from client_inbounds where inbound_id=?", (old_id,))]
             db.execute("delete from client_inbounds where inbound_id=?", (old_id,))
             for client_row_id in linked:
                 db.execute("delete from clients where id=? and not exists (select 1 from client_inbounds where client_id=?)", (client_row_id, client_row_id))
-        db.execute("delete from inbounds where remark in ('AUTO-GATEWAY','VPS-DIRECT')")
+        db.execute("delete from inbounds where remark in ('AUTO-GATEWAY','VPS-DIRECT','服务器直连')")
         columns = [r[1] for r in db.execute("pragma table_info(inbounds)")]
         names = [name for name in inbound if name in columns]
         placeholders = ",".join("?" for _ in names)

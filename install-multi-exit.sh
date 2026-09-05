@@ -25,14 +25,17 @@ install -o root -g root -m 0755 "${SCRIPT_DIR}/multi_exit_manager.py" /usr/local
 install -o root -g root -m 0755 "${SCRIPT_DIR}/xui_multi_provision.py" /usr/local/sbin/xui-multi-provision
 
 if [[ ! -s "${CHANNEL_FILE}" ]]; then
-  cat > "${CHANNEL_FILE}" <<'EOF'
+  install_date="$(date +%Y%m%d)"
+  install_epoch="$(date +%s)"
+  cat > "${CHANNEL_FILE}" <<EOF
 {
   "version": 4,
   "direct_protocol": "hysteria",
   "channels": [
     {
       "id": "us",
-      "name": "美国线路",
+      "name": "美国-${install_date}",
+      "created_at": ${install_epoch},
       "inbound_port": 7825,
       "country": "美国",
       "protocol": "hysteria",
@@ -45,7 +48,8 @@ if [[ ! -s "${CHANNEL_FILE}" ]]; then
     },
     {
       "id": "jp",
-      "name": "日本线路",
+      "name": "日本-${install_date}",
+      "created_at": ${install_epoch},
       "inbound_port": 7866,
       "country": "日本",
       "protocol": "trojan",
@@ -58,7 +62,8 @@ if [[ ! -s "${CHANNEL_FILE}" ]]; then
     },
     {
       "id": "kr",
-      "name": "韩国线路",
+      "name": "韩国-${install_date}",
+      "created_at": ${install_epoch},
       "inbound_port": 7888,
       "country": "韩国",
       "protocol": "vless",

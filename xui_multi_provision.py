@@ -141,7 +141,7 @@ def source_inbound(db):
     row = db.execute(
         """select * from inbounds
         where protocol in ('vless','trojan','hysteria') and remark not like 'COUNTRY:%'
-        order by case when remark in ('AUTO-GATEWAY','VPS-DIRECT') then 0 else 1 end, id limit 1"""
+        order by case when remark in ('AUTO-GATEWAY','VPS-DIRECT','服务器直连') then 0 else 1 end, id limit 1"""
     ).fetchone()
     if not row:
         raise RuntimeError("未找到可复制的 VLESS、Trojan 或 Hysteria2 入站")
@@ -289,7 +289,7 @@ def main():
             direct_tag = f"in-{source['port']}-{'udp' if direct_protocol == 'hysteria' else 'tcp'}"
             remove_normalized_client(db, source["id"])
             db.execute(
-                "update inbounds set remark='VPS-DIRECT',protocol=?,tag=?,settings=?,stream_settings=? where id=?",
+                "update inbounds set remark='服务器直连',protocol=?,tag=?,settings=?,stream_settings=? where id=?",
                 (direct_protocol, direct_tag, compact(protocol_settings(direct_protocol, direct_client)),
                  compact(protocol_stream(source_stream, direct_protocol, direct_client)), source["id"]),
             )
@@ -361,7 +361,7 @@ def main():
     output = {
         "backup": str(backup),
         "direct": {
-            "name": source.get("remark") or "VPS Direct",
+            "name": "服务器直连",
             "port": source["port"],
             "protocol": direct_protocol,
             "subId": direct_client.get("subId"),
