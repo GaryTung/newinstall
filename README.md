@@ -1,6 +1,6 @@
-# 多国家独立出口节点管理系统
+# 多国家独立出口管理系统
 
-适用于 Ubuntu 22.04/24.04、Debian 12。安装器会部署节点管理后台、3x-ui、TLS证书、订阅和多国家独立 VPNGate出口。
+适用于 Ubuntu 22.04/24.04、Debian 12。安装器会部署节点管理后台、3 x- ui、TL S证书、订阅和多国家独立出口。
 
 ## 一行安装
 
@@ -16,7 +16,7 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/GaryTung/newinstall
 
 - VPS直连节点与多国家独立出口同时存在；
 - 每个国家可独立选择 VLESS、Trojan 或 Hysteria2；
-- 每个国家使用独立端口、网络命名空间、OpenVPN和出口；
+- 每个国家使用独立端口、网络命名空间、Open VPN和出口；
 - 严格锁定国家，不会在目标国家失败时跳到其他国家；
 - 支持住宅优先、仅住宅、仅机房或全部IP；
 - 支持添加、删除、保存和手动切换单个国家线路；
