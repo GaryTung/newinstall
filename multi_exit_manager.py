@@ -12,6 +12,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -49,6 +50,7 @@ HEALTH_ENDPOINTS = (
     "https://ipv4.icanhazip.com",
     "https://ifconfig.me/ip",
 )
+WAKE_EVENT = threading.Event()
 
 COUNTRY_ALIASES = {
     "美国": {"美国", "United States", "US"},
@@ -658,6 +660,7 @@ def connect_channel(channel, index, previous, history):
 
 
 def daemon():
+    signal.signal(signal.SIGUSR1, lambda _signum, _frame: WAKE_EVENT.set())
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     state = read_json(STATE_FILE, {"channels": {}})
     state.setdefault("channels", {})
@@ -833,7 +836,8 @@ def daemon():
                     state["channels"][channel["id"]] = runtime
             write_json(STATE_FILE, state)
         first_pass = False
-        time.sleep(CHECK_SECONDS if all(x.get("status") == "connected" for x in state.get("channels", {}).values()) else RETRY_SECONDS)
+        WAKE_EVENT.wait(CHECK_SECONDS if all(x.get("status") == "connected" for x in state.get("channels", {}).values()) else RETRY_SECONDS)
+        WAKE_EVENT.clear()
 
 
 def status():

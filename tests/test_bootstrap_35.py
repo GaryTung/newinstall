@@ -16,13 +16,22 @@ class BootstrapTests(unittest.TestCase):
                'server_node_name': lambda name: '236.' + name}
         exec(compile(selected, 'names', 'exec'), env)
         stamp = time.mktime(time.strptime('20260905', '%Y%m%d'))
-        self.assertEqual(env['channel_display_name']({'country': '日本', 'protocol': 'vless', 'created_at': stamp}), '236.日本-VLESS-20260905')
+        self.assertEqual(env['channel_display_name']({'country': '日本', 'protocol': 'vless', 'inbound_port': 7866, 'created_at': stamp}), '236.日本-VLESS-7866-20260905')
         self.assertIn('names[str(direct["subId"])] = server_node_name("服务器直连")', source)
 
-    def test_same_country_can_use_different_protocols(self):
+    def test_same_country_and_protocol_can_use_different_ports(self):
         source = (Path(__file__).resolve().parents[1] / 'vpngate_manager.py').read_text(encoding='utf-8')
         self.assertNotIn('configured.has(country)', source)
-        self.assertIn('已经存在相同协议的线路，请选择另一协议', source)
+        self.assertNotIn('已经存在相同协议的线路，请选择另一协议', source)
+        self.assertIn('该端口已被其他国家线路使用', source)
+
+    def test_manual_ip_selection_is_saved_and_wakes_only_changed_channel(self):
+        manager = (Path(__file__).resolve().parents[1] / 'vpngate_manager.py').read_text(encoding='utf-8')
+        daemon = (Path(__file__).resolve().parents[1] / 'multi_exit_manager.py').read_text(encoding='utf-8')
+        self.assertIn('payload.preferred_node_id=preferredNodeId', manager)
+        self.assertIn('wake_multi_exit_service()', manager)
+        self.assertIn('candidate.get("probe_status") != "available"', manager)
+        self.assertIn('WAKE_EVENT.wait(', daemon)
 
     def test_fresh_direct_inbound_accepts_server_suffix_name(self):
         source = Path(__file__).resolve().parents[1] / 'xui_provision.py'

@@ -599,6 +599,14 @@ def find_multi_channel(config: dict[str, Any], channel_id: str) -> tuple[int, di
     raise ValueError("未找到指定的国家线路")
 
 
+def wake_multi_exit_service() -> None:
+    """Wake the daemon so one channel applies a saved/manual selection immediately."""
+    subprocess.run(
+        ["systemctl", "kill", "--kill-whom=main", "--signal=SIGUSR1", "aimilivpn-multiexit.service"],
+        check=False, capture_output=True, text=True, timeout=5,
+    )
+
+
 def channel_candidate_nodes(channel: dict[str, Any], source: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     if source is None:
         with lock:
@@ -2420,13 +2428,19 @@ def channel_display_name(channel: dict[str, Any]) -> str:
     protocol = {"hysteria": "HY2", "vless": "VLESS", "trojan": "Trojan"}.get(
         str(channel.get("protocol") or "hysteria").lower(), "HY2"
     )
+    port = int(channel.get("inbound_port") or 0)
+    port_label = f"-{port}" if port else ""
     created_at = float(channel.get("created_at") or time.time())
-    return server_node_name(f"{country}-{protocol}-{time.strftime('%Y%m%d', time.localtime(created_at))}")
+    return server_node_name(f"{country}-{protocol}{port_label}-{time.strftime('%Y%m%d', time.localtime(created_at))}")
 
 
-def generated_channel_name(country: Any, country_nodes: list[dict[str, Any]], protocol: str = "hysteria") -> str:
+def generated_channel_name(
+    country: Any, country_nodes: list[dict[str, Any]], protocol: str = "hysteria", inbound_port: int = 0
+) -> str:
     """Return a distinct country/protocol name plus today's creation date."""
-    return channel_display_name({"country": country, "protocol": protocol, "created_at": time.time()})
+    return channel_display_name({
+        "country": country, "protocol": protocol, "inbound_port": inbound_port, "created_at": time.time(),
+    })
 
 
 def normalize_node_country_catalog() -> int:
@@ -5616,7 +5630,7 @@ const multiExitSelectedNodes = {};
 function rememberMultiExitFold(id, isOpen){
   if(isOpen)multiExitExpandedCards.add(id);else multiExitExpandedCards.delete(id);
 }
-function rememberMultiExitCandidate(id, nodeId){multiExitSelectedNodes[id]=nodeId;}
+function rememberMultiExitCandidate(id, nodeId){multiExitSelectedNodes[id]=nodeId;channelMessage(id,'已选中候选 IP；点击“切换到所选 IP”可立即应用，或点击“保存并应用本线路”一起保存。');}
 async function loadMultiExit(){
   try { const r=await fetch("./api/multi_exit"); const d=await r.json(); if(d.ok){multiExitData=d;renderMultiExit();} } catch(e){}
 }
@@ -5694,9 +5708,8 @@ function renderAddChannelCountries(){
 function updateAddChannelCountryHint(){
   const option=$("new_channel_country")?.selectedOptions?.[0];
   const protocol=$("new_channel_protocol")?.value||'hysteria';
-  const existing=(multiExitData.config.channels||[]).filter(c=>translateCountry(c.country)===option?.value).map(c=>multiProtocolLabel(c.protocol));
-  const duplicate=(multiExitData.config.channels||[]).some(c=>translateCountry(c.country)===option?.value&&(c.protocol||'hysteria')===protocol);
-  const hint=$("new_channel_country_hint");if(hint)hint.textContent=option&&option.value?`创建后会先检测 ${option.value} 的候选节点；当前可用 ${option.dataset.available||0} 个，共 ${option.dataset.total||0} 个。${existing.length?' 已有协议：'+existing.join('、')+'。':''}${duplicate?' 当前协议已存在，请选择另一协议。':''}`:'节点清单中没有可创建的国家出口。';
+  const existing=(multiExitData.config.channels||[]).filter(c=>translateCountry(c.country)===option?.value).map(c=>`${multiProtocolLabel(c.protocol)}:${c.inbound_port}`);
+  const hint=$("new_channel_country_hint");if(hint)hint.textContent=option&&option.value?`创建后会先检测 ${option.value} 的候选节点；当前可用 ${option.dataset.available||0} 个，共 ${option.dataset.total||0} 个。${existing.length?' 已有线路：'+existing.join('、')+'；仍可用不同端口继续创建。':''}`:'节点清单中没有可创建的国家出口。';
 }
 function openAddChannelModal(){
   $("new_channel_port").value=randomAvailableChannelPort();$("new_channel_protocol").value='hysteria';$("new_channel_ip_type").value='residential_preferred';
@@ -5708,7 +5721,7 @@ async function createMultiExitChannel(){
   const error=$("new_channel_error");const button=$("new_channel_create");
   if(!country){error.textContent='请选择一个有候选节点的国家';error.style.display='block';return;}
   if(!Number.isInteger(port)||port<1024||port>65535){error.textContent='端口必须在 1024 至 65535 之间';error.style.display='block';return;}
-  if((multiExitData.config.channels||[]).some(c=>translateCountry(c.country)===country&&(c.protocol||'hysteria')===protocol)){error.textContent=`${country} 已经存在 ${multiProtocolLabel(protocol)} 线路，请选择另一协议`;error.style.display='block';return;}
+  if((multiExitData.config.channels||[]).some(c=>Number(c.inbound_port||0)===port)){error.textContent=`端口 ${port} 已被其他线路使用，请更换端口`;error.style.display='block';return;}
   const id=('line'+Date.now().toString(36)).slice(0,12);button.disabled=true;button.textContent='正在创建...';error.style.display='none';
   try{
     const r=await fetch('./api/update_multi_exit_channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,name:country+'线路',country,inbound_port:port,protocol,ip_type:ipType})});
@@ -5730,11 +5743,6 @@ async function deleteMultiExitChannel(id){
 }
 function channelCard(id){return document.querySelector(`[data-channel-card="${CSS.escape(id)}"]`);}
 function channelMessage(id,text){const el=$("channel-message-"+id);if(el)el.textContent=text;}
-async function saveMultiExitChannel(id){
-  const card=channelCard(id);if(!card)return;const country=card.querySelector('[data-field=country]').value;
-  const payload={id,name:country+'线路',country,inbound_port:parseInt(card.querySelector('[data-field=inbound_port]').value),protocol:card.querySelector('[data-field=protocol]').value,ip_type:card.querySelector('[data-field=ip_type]').value};
-  channelMessage(id,'正在仅保存当前线路...');try{const r=await fetch('./api/update_multi_exit_channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'保存失败');channelMessage(id,d.message);await loadMultiExit();}catch(e){channelMessage(id,e.message);}
-}
 async function testMultiExitChannel(id){
   const startedAt=Date.now()/1000;channelMessage(id,'正在启动本国节点检测...');try{const r=await fetch('./api/test_multi_exit_channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel_id:id})});const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'启动失败');channelMessage(id,d.message);monitorChannelAvailability(id,startedAt);}catch(e){channelMessage(id,e.message);}
 }
@@ -5753,7 +5761,7 @@ async function monitorChannelAvailability(id,startedAt){
   channelMessage(id,'检测超时，请刷新页面查看状态');
 }
 async function switchMultiExitNode(id){
-  const card=channelCard(id);const selected=card&&card.querySelector(`input[name="candidate-${CSS.escape(id)}"]:checked`);if(!selected){channelMessage(id,'请先选择一个候选 IP');return;}channelMessage(id,'正在切换当前国家出口...');try{const r=await fetch('./api/switch_multi_exit_node',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel_id:id,node_id:selected.value})});const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'切换失败');channelMessage(id,d.message);setTimeout(loadMultiExit,3000);}catch(e){channelMessage(id,e.message);}
+  const card=channelCard(id);const selected=card&&card.querySelector(`input[name="candidate-${CSS.escape(id)}"]:checked`);const nodeId=multiExitSelectedNodes[id]||(selected&&selected.value);if(!nodeId){channelMessage(id,'请先选择一个候选 IP');return;}const channel=(multiExitData.config.channels||[]).find(item=>item.id===id);const candidate=(channel&&channel.candidates||[]).find(n=>n.id===nodeId);if(!candidate||candidate.probe_status!=='available'){channelMessage(id,'所选 IP 当前不是“可用”状态，请先检测本国节点可用性');return;}channelMessage(id,'正在立即切换当前国家出口...');try{const r=await fetch('./api/switch_multi_exit_node',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel_id:id,node_id:nodeId})});const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'切换失败');multiExitSelectedNodes[id]=nodeId;channelMessage(id,d.message);setTimeout(loadMultiExit,1500);}catch(e){channelMessage(id,e.message);}
 }
 let copyNoticeTimer;
 function showCopyNotice(message, success){
@@ -5798,16 +5806,18 @@ async function saveMultiExit(){
 async function saveMultiExitChannel(id){
   const card=channelCard(id);if(!card)return;
   const country=card.querySelector('[data-field=country]').value;
-  const selected=card.querySelector(`input[name="candidate-${CSS.escape(id)}"]:checked`);
+  const selectedNodeId=multiExitSelectedNodes[id]||'';
   const original=(multiExitData.config.channels||[]).find(item=>item.id===id);
-  const preferredNodeId=original&&translateCountry(original.country)===translateCountry(country)&&selected?selected.value:'';
+  const preferredNodeId=original&&translateCountry(original.country)===translateCountry(country)?selectedNodeId:'';
+  const candidate=preferredNodeId&&((original&&original.candidates)||[]).find(n=>n.id===preferredNodeId);
+  if(preferredNodeId&&(!candidate||candidate.probe_status!=='available')){channelMessage(id,'所选 IP 当前不是“可用”状态，请先检测本国节点可用性');return;}
   const payload={
     id,name:country,country,
     inbound_port:parseInt(card.querySelector('[data-field=inbound_port]').value),
     protocol:card.querySelector('[data-field=protocol]').value,
     ip_type:card.querySelector('[data-field=ip_type]').value,
-    preferred_node_id:preferredNodeId,
   };
+  if(preferredNodeId)payload.preferred_node_id=preferredNodeId;
   channelMessage(id,'\u6b63\u5728\u4fdd\u5b58\u5e76\u5207\u6362\u5f53\u524d\u7ebf\u8def...');
   try{
     const r=await fetch('./api/update_multi_exit_channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
@@ -7869,19 +7879,19 @@ class Handler(BaseHTTPRequestHandler):
                     index = len(config.setdefault("channels", []))
                     updated = {"id": channel_id, "enabled": True, "preferred_node_id": ""}
                     config["channels"].append(updated)
-                if any(
-                    str(item.get("id")) != channel_id
-                    and normalized_country_name(item.get("country")) == normalized_country_name(country)
-                    and str(item.get("protocol") or "hysteria").lower() == protocol
-                    for item in config.get("channels", [])
-                ):
-                    raise ValueError(f"{country} 已经存在相同协议的线路，请选择另一协议")
                 if any(str(item.get("id")) != channel_id and int(item.get("inbound_port") or 0) == port for item in config.get("channels", [])):
                     raise ValueError("该端口已被其他国家线路使用")
+                inbound_changed = bool(
+                    is_new_channel or country_changed
+                    or int(updated.get("inbound_port") or 0) != port
+                    or str(updated.get("protocol") or "hysteria").lower() != protocol
+                )
                 if is_new_channel or country_changed:
-                    channel_name = generated_channel_name(country, country_nodes, protocol)
+                    channel_name = generated_channel_name(country, country_nodes, protocol, port)
                 else:
-                    channel_name = channel_display_name({**updated, "country": country, "protocol": protocol})
+                    channel_name = channel_display_name({
+                        **updated, "country": country, "protocol": protocol, "inbound_port": port,
+                    })
                 updated.update({
                     "id": channel_id, "name": channel_name,
                     "country": country, "inbound_port": port, "protocol": protocol,
@@ -7892,6 +7902,15 @@ class Handler(BaseHTTPRequestHandler):
                         str(node.get("id") or "") == requested_preferred for node in country_nodes
                     ):
                         raise ValueError("The selected IP is not a candidate for this country")
+                    selected_candidate = next(
+                        (node for node in country_nodes if str(node.get("id") or "") == requested_preferred), {}
+                    )
+                    if requested_preferred and selected_candidate.get("probe_status") != "available":
+                        raise ValueError("所选 IP 当前不是可用状态，请先检测本国节点可用性")
+                    if requested_preferred and ip_type == "residential_only" and selected_candidate.get("ip_type") not in ("residential", "mobile"):
+                        raise ValueError("当前线路仅允许住宅 IP")
+                    if requested_preferred and ip_type == "hosting_only" and selected_candidate.get("ip_type") != "hosting":
+                        raise ValueError("当前线路仅允许机房 IP")
                     updated["preferred_node_id"] = requested_preferred
                 if is_new_channel or country_changed:
                     updated["created_at"] = time.time()
@@ -7901,15 +7920,16 @@ class Handler(BaseHTTPRequestHandler):
                 config["channels"][index] = updated
                 config["version"] = max(3, int(config.get("version") or 1))
                 write_json(MULTI_EXIT_DIR / "channels.json", config)
-                provision = Path("/usr/local/sbin/xui-multi-provision")
-                subprocess.run(["systemctl", "stop", "x-ui"], check=True, timeout=20)
-                try:
-                    subprocess.run([str(provision), "--channels", str(MULTI_EXIT_DIR / "channels.json"), "--channel-id", channel_id], check=True, timeout=60)
-                except Exception:
-                    write_json(MULTI_EXIT_DIR / "channels.json", old_config)
-                    raise
-                finally:
-                    subprocess.run(["systemctl", "start", "x-ui"], check=False, timeout=20)
+                if inbound_changed:
+                    provision = Path("/usr/local/sbin/xui-multi-provision")
+                    subprocess.run(["systemctl", "stop", "x-ui"], check=True, timeout=20)
+                    try:
+                        subprocess.run([str(provision), "--channels", str(MULTI_EXIT_DIR / "channels.json"), "--channel-id", channel_id], check=True, timeout=60)
+                    except Exception:
+                        write_json(MULTI_EXIT_DIR / "channels.json", old_config)
+                        raise
+                    finally:
+                        subprocess.run(["systemctl", "start", "x-ui"], check=False, timeout=20)
                 if shutil.which("ufw"):
                     status = subprocess.run(["ufw", "status"], capture_output=True, text=True, timeout=10)
                     if "Status: active" in status.stdout:
@@ -7918,7 +7938,12 @@ class Handler(BaseHTTPRequestHandler):
                 if is_new_channel or country_changed:
                     ensure_channel_bootstrap(channel_id)
                     message = f"{country}线路已创建，正在优先检测本国节点；完成后会按所选 IP 类型自动连接"
+                elif requested_preferred:
+                    wake_multi_exit_service()
+                    selected_ip = str(selected_candidate.get("ip") or selected_candidate.get("remote_host") or requested_preferred)
+                    message = f"本线路设置已保存，正在立即切换到 {selected_ip}；其他线路不受影响"
                 else:
+                    wake_multi_exit_service()
                     message = f"{country}线路已单独保存并应用，其他国家配置未重建"
                 self.send_json({"ok": True, "message": message, "initial_test_started": bool(is_new_channel or country_changed)})
             except Exception as exc:
@@ -7988,9 +8013,11 @@ class Handler(BaseHTTPRequestHandler):
                 node_id = str(payload.get("node_id") or "").strip()
                 config = read_multi_exit_config()
                 index, channel = find_multi_channel(config, channel_id)
-                candidate = next((node for node in channel_candidate_nodes(channel) if node.get("id") == node_id), None)
+                candidate = next((node for node in channel_candidate_nodes(channel) if str(node.get("id") or "") == node_id), None)
                 if not candidate:
                     raise ValueError("所选 IP 不属于当前国家")
+                if candidate.get("probe_status") != "available":
+                    raise ValueError("所选 IP 当前不是可用状态，请先检测本国节点可用性")
                 mode = str(channel.get("ip_type") or "all")
                 if mode == "residential_only" and candidate.get("ip_type") not in ("residential", "mobile"):
                     raise ValueError("当前线路仅允许住宅 IP")
@@ -8000,7 +8027,8 @@ class Handler(BaseHTTPRequestHandler):
                 channel["restart_token"] = time.time()
                 config["channels"][index] = channel
                 write_json(MULTI_EXIT_DIR / "channels.json", config)
-                self.send_json({"ok": True, "message": f"已要求{channel.get('country')}线路切换到 {candidate.get('ip') or node_id}；若该 IP 失败，将按本线路策略选择同国备用节点"})
+                wake_multi_exit_service()
+                self.send_json({"ok": True, "message": f"正在立即把{channel.get('country')}线路切换到 {candidate.get('ip') or node_id}；若该 IP 连接失败，将按本线路策略选择同国备用节点"})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
