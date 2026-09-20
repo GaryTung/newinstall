@@ -611,6 +611,22 @@ def wake_multi_exit_service() -> None:
     )
 
 
+def request_channel_speed_test(channel_id: str) -> dict[str, Any]:
+    """Queue a speed comparison without restarting any live tunnel."""
+    with multi_config_lock:
+        config = read_multi_exit_config()
+        index, channel = find_multi_channel(config, channel_id)
+        if not channel.get("enabled", True):
+            raise ValueError("请先启用该国家线路")
+        channel["speed_auto"] = True
+        channel["preferred_node_id"] = ""
+        channel["speed_request_token"] = time.time()
+        config["channels"][index] = channel
+        write_json(MULTI_EXIT_DIR / "channels.json", config)
+    wake_multi_exit_service()
+    return {"ok": True, "running": True, "message": "已排队测速并自动择优；已解除手动 IP 固定，测速期间保留当前连接，仅比较符合本线路策略的出口。"}
+
+
 def channel_candidate_nodes(channel: dict[str, Any], source: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     if source is None:
         with lock:
@@ -723,6 +739,10 @@ def mark_channel_ready(channel_id: str, preferred_node_id: str = "") -> None:
 def multi_exit_payload() -> dict[str, Any]:
     config = read_multi_exit_config()
     runtime = read_json(MULTI_EXIT_DIR / "state.json", {"channels": {}})
+    speed_results = read_json(MULTI_EXIT_DIR / "speed_results.json", {})
+    speed_channels = speed_results.get("channels", {}) if isinstance(speed_results, dict) else {}
+    if not isinstance(speed_channels, dict):
+        speed_channels = {}
     result = read_json(Path("/etc/x-ui/multi-exit-result.json"), {"channels": []})
     subscriptions = {str(item.get("id") or ""): item for item in result.get("channels", [])}
     host = public_subscription_host()
@@ -742,6 +762,9 @@ def multi_exit_payload() -> dict[str, Any]:
     }
     for channel in config.get("channels", []):
         cid = str(channel.get("id") or "")
+        channel["speed_auto"] = channel.get("speed_auto", True) is not False
+        speed_test = speed_channels.get(cid, {})
+        channel["speed_test"] = speed_test if isinstance(speed_test, dict) else {}
         channel["candidates"] = channel_candidate_nodes(channel, source_nodes)
         state = runtime_channels.get(cid, {})
         current = next((node for node in channel["candidates"] if node.get("id") == state.get("node_id")), {})
@@ -5660,6 +5683,24 @@ function multiCountryOptions(selected){
 function multiProtocolLabel(value){return value==='hysteria'?'HY2':(value==='trojan'?'Trojan':'VLESS');}
 function multiIpTypeLabel(value){return ({residential:'住宅',mobile:'移动',hosting:'机房',unknown:'未知'})[value]||value||'未知';}
 function multiProbeLabel(value){return ({available:'可用',unavailable:'不可用',testing:'检测中',not_checked:'待检测'})[value]||'待检测';}
+function multiSpeedMbps(value){const speed=Number(value);return Number.isFinite(speed)&&speed>0?(speed*8/1000000).toFixed(2)+' Mbps':'-';}
+function multiSpeedTime(value){const stamp=Number(value);return stamp>0?new Date(stamp*1000).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}):'';}
+function multiSpeedCell(sample){
+  if(!sample)return '<small style="display:block;color:var(--text-secondary)">未测速</small>';
+  const stale=Date.now()/1000-Number(sample.tested_at||0)>10800;
+  const title=sample.ok?'小样本实际下载速率，含握手；不是峰值带宽':sample.error||'未完成实际下载';
+  return `<small title="${esc(title)}" style="display:block;color:${stale?'var(--text-secondary)':sample.ok?'var(--success)':'var(--warning)'}">${sample.ok?esc(multiSpeedMbps(sample.bps)):'测速失败'}${stale?' · 已过期':''}</small><small style="display:block;color:var(--text-secondary)">${esc(multiSpeedTime(sample.tested_at))}</small>`;
+}
+function multiSpeedSummary(channel){
+  const result=channel.speed_test||{};
+  const label=({testing:'正在测速',complete:'本轮完成',error:'测速暂未完成',waiting:'等待测速'})[result.status]||'等待首次测速';
+  const requested=Number(channel.speed_request_token||0)>Number(result.request_token||0);
+  const active=result.status==='testing'||result.status==='waiting';
+  const queued=requested;
+  const progress=active&&Number(result.total)>0?` · ${Number(result.tested||0)}/${Number(result.total)}`:'';
+  const winner=result.winner_bps&&result.status==='complete'&&!queued?` · 本轮优选 ${multiSpeedMbps(result.winner_bps)}`:'';
+  return `${queued?'已排队测速':label}${queued?'':progress}${winner}${result.message&&!queued?' · '+result.message:''}`;
+}
 function multiRowBackground(value){return value==='available'?'rgba(34,197,94,.16)':(value==='unavailable'?'rgba(239,68,68,.16)':'rgba(245,158,11,.17)');}
 function multiCandidateMatchesPolicy(node,policy){if(node.policy_rejection)return false;const t=node.ip_type||'unknown';if(policy==='residential_only')return t==='residential'||t==='mobile';if(policy==='hosting_only')return t==='hosting';return true;}
 function suggestedSocksPort(channel){
@@ -5686,21 +5727,28 @@ function renderMultiExit(){
   const runtime=(multiExitData.state&&multiExitData.state.channels)||{};
   const channels=multiExitData.config.channels||[];
   const connectedCount=channels.filter(c=>(runtime[c.id]||{}).status==='connected').length;
-  if($('channel_overview'))$('channel_overview').innerHTML=`<span>国家出口 <b>${channels.length}</b></span><span style="color:#34d399">已连接 <b>${connectedCount}</b></span><span style="color:#fbbf24">待连接 <b>${channels.length-connectedCount}</b></span><span>自动检测已配置国家 · 健康出口保持原 IP</span>`;
+  if($('channel_overview'))$('channel_overview').innerHTML=`<span>国家出口 <b>${channels.length}</b></span><span style="color:#34d399">已连接 <b>${connectedCount}</b></span><span style="color:#fbbf24">待连接 <b>${channels.length-connectedCount}</b></span><span>同国策略内测速择优 · 手动指定优先</span>`;
   box.innerHTML=(multiExitData.config.channels||[]).map((c,i)=>{
     const s=runtime[c.id]||{}; const status=s.status||(c.awaiting_initial_test?'testing':'connecting'); const ok=status==="connected"; const pending=['connecting','switching','testing'].includes(status); const candidates=c.candidates||[];
     const available=candidates.filter(n=>n.probe_status==='available'&&multiCandidateMatchesPolicy(n,c.ip_type)).length;
     const excluded=candidates.filter(n=>n.policy_rejection).length;
+    const speedSamples=(c.speed_test&&c.speed_test.samples)||{};
     const selectedNodeId=multiExitSelectedNodes[c.id]||c.preferred_node_id||s.node_id||'';
     const rows=candidates.map(n=>{const current=n.id===s.node_id;const preferred=n.id===c.preferred_node_id;const checked=n.id===selectedNodeId;const rejection=n.policy_rejection||'';return `<label title="${esc(rejection||n.probe_message||'')}" style="display:grid;grid-template-columns:28px 1.2fr .8fr 1.2fr .7fr .7fr;gap:8px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--border-color);border-left:4px solid ${rejection?'#94a3b8':n.probe_status==='available'?'#22c55e':(n.probe_status==='unavailable'?'#ef4444':'#f59e0b')};font-size:12px;background:${rejection?'rgba(148,163,184,.10)':multiRowBackground(n.probe_status)};${current?'font-weight:700;outline:1px solid rgba(59,130,246,.55);outline-offset:-1px;':''}">
       <input type="radio" name="candidate-${esc(c.id)}" value="${esc(n.id)}" ${checked?'checked':''} ${rejection?'disabled':''} onchange="rememberMultiExitCandidate('${esc(c.id)}','${esc(n.id)}')">
-      <span>${esc(n.ip||n.entry_ip||'-')}${current?' <b style="color:var(--success)">当前</b>':''}</span><span>${esc(multiIpTypeLabel(n.ip_type))}</span><span title="${esc(n.owner||'')}">${esc(n.owner||'-')}</span><span>${rejection?'策略排除':esc(multiProbeLabel(n.probe_status))}</span><span>${n.latency_ms?esc(n.latency_ms+' ms'):'-'}</span>${rejection?'<span style="grid-column:2/-1;color:var(--text-secondary)">'+esc(rejection)+'</span>':''}</label>`;}).join('');
+      <span>${esc(n.ip||n.entry_ip||'-')}${current?' <b style="color:var(--success)">当前</b>':''}</span><span>${esc(multiIpTypeLabel(n.ip_type))}</span><span title="${esc(n.owner||'')}">${esc(n.owner||'-')}</span><span>${rejection?'策略排除':esc(multiProbeLabel(n.probe_status))}</span><span>${n.latency_ms?esc(n.latency_ms+' ms'):'-'}${multiSpeedCell(speedSamples[n.id])}</span>${rejection?'<span style="grid-column:2/-1;color:var(--text-secondary)">'+esc(rejection)+'</span>':''}</label>`;}).join('');
     const stateLabel=ok?'已连接':(c.awaiting_initial_test?'等待 / 首次检测':status==='testing'?'正在检测':pending?'正在连接':'断线恢复中');
     return `<section class="country-card" data-health="${ok?'connected':pending?'pending':'failed'}" data-channel-card="${esc(c.id)}">
       <div style="display:flex;justify-content:space-between;gap:12px;align-items:center"><div><strong style="font-size:20px">${esc(c.country||c.name||c.id)}</strong><span style="font-size:12px;color:var(--text-secondary);margin-left:12px">${esc(multiProtocolLabel(c.protocol))} · ${esc(c.inbound_port)}</span></div><span class="badge ${ok?'available':(pending?'testing':'unavailable')}">${stateLabel}</span></div>
       <div class="channel-facts"><div><small>中转入口 · VPNGate 节点</small><strong>${esc(s.entry_ip||'尚未选定')}</strong>${esc(s.entry_provider||'选定节点后显示服务商')}</div><div><small>实际公网出口</small><strong>${esc(s.exit_ip||'尚未连接')}</strong>${esc(s.exit_provider||'连接验证后显示服务商')} · ${esc(multiIpTypeLabel(s.exit_ip_type))}</div></div>
-      <div class="channel-state-note">${esc(c.awaiting_initial_test?'系统自动排队检测本国候选，找到首个合格节点后立即连接。':s.error||(ok?'出口正常，保持当前 IP；备用节点由后台维护。':'系统正在选择并验证本国出口。'))}</div>
+      <div class="channel-state-note">${esc(c.awaiting_initial_test?'系统自动排队检测本国候选，找到首个合格节点后立即连接。':s.error||(ok?(c.preferred_node_id?'出口正常，手动指定 IP 优先；自动测速切换已暂缓。':c.speed_auto!==false?'出口正常，后台分批测速；同策略出口明显更快时自动切换。':'出口正常，保持当前 IP；备用节点由后台维护。'):'系统正在选择并验证本国出口。'))}</div>
       <div class="channel-fields"><label>出口国家<select data-field="country" class="input-field">${multiCountryOptions(c.country)}</select></label><label>入站端口<input data-field="inbound_port" type="number" min="1024" max="65535" class="input-field" value="${c.inbound_port}"></label><label>连接协议<select data-field="protocol" class="input-field"><option value="vless" ${c.protocol==='vless'?'selected':''}>VLESS</option><option value="trojan" ${c.protocol==='trojan'?'selected':''}>Trojan</option><option value="hysteria" ${(c.protocol||'hysteria')==='hysteria'?'selected':''}>HY2</option></select></label><label>IP 选择策略<select data-field="ip_type" class="input-field"><option value="all" ${c.ip_type==='all'?'selected':''}>全部 IP</option><option value="residential_preferred" ${c.ip_type==='residential_preferred'?'selected':''}>住宅优先</option><option value="residential_only" ${c.ip_type==='residential_only'?'selected':''}>仅住宅</option><option value="hosting_only" ${c.ip_type==='hosting_only'?'selected':''}>仅机房</option></select></label></div>
+      <div style="margin-top:14px;padding:12px 14px;border:1px solid rgba(139,92,246,.35);border-radius:10px;background:rgba(139,92,246,.06)">
+        <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><label style="display:flex;gap:8px;align-items:center;font-weight:700"><input data-field="speed_auto" type="checkbox" ${c.speed_auto!==false?'checked':''} onchange="channelMessage('${esc(c.id)}','请点击保存并应用本线路，保存自动测速设置；手动指定 IP 优先。')"> 自动测速择优</label><button class="toolbar-btn" onclick="speedMultiExitChannel('${esc(c.id)}')">测速并自动择优</button></div>
+        <div style="font-size:12px;margin-top:8px">${esc(multiSpeedSummary(c))}</div>
+        <div style="font-size:11px;color:var(--text-secondary);margin-top:6px">每 15 分钟分批轮测，单轮最多 6 个；以两次 1 MiB 实际下载的较慢值比较，并非峰值带宽。同类型自动切换需提速超过 25%，间隔至少 30 分钟；保持国家、IP 类型和服务商排除规则。${c.preferred_node_id?' 当前已手动指定 IP；点击“测速并自动择优”会解除手动固定。':''}</div>
+        ${s.speed_switch_reason?`<div style="font-size:11px;color:var(--text-secondary);margin-top:5px">上次择优：${esc(s.speed_switch_reason)} · ${esc(multiSpeedTime(s.speed_switch_at))}</div>`:''}
+      </div>
       <div style="margin-top:14px;padding:14px;border:1px solid ${c.socks_enabled?'rgba(34,197,94,.55)':'var(--border-color)'};border-radius:10px;background:${c.socks_enabled?'rgba(34,197,94,.07)':'rgba(148,163,184,.04)'}">
         <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap"><label style="display:flex;gap:8px;align-items:center;font-weight:700"><input data-field="socks_enabled" type="checkbox" ${c.socks_enabled?'checked':''} onchange="toggleChannelSocksFields('${esc(c.id)}')"> 启用指纹浏览器 SOCKS5</label><span style="font-size:12px;color:var(--text-secondary)">强制账号密码验证 · 固定跟随本线路出口</span></div>
         <div data-socks-fields class="channel-fields" style="margin-top:12px">
@@ -5784,6 +5832,15 @@ function toggleChannelSocksFields(id){const card=channelCard(id);if(!card)return
 async function testMultiExitChannel(id){
   const startedAt=Date.now()/1000;channelMessage(id,'正在启动本国节点检测...');try{const r=await fetch('./api/test_multi_exit_channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel_id:id})});const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'启动失败');channelMessage(id,d.message);monitorChannelAvailability(id,startedAt);}catch(e){channelMessage(id,e.message);}
 }
+async function speedMultiExitChannel(id){
+  channelMessage(id,'正在排队测速；现有连接保持运行...');
+  try{
+    const r=await fetch('./api/speed_multi_exit_channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel_id:id})});
+    const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'启动测速失败');
+    delete multiExitSelectedNodes[id];
+    await loadMultiExit();channelMessage(id,d.message);
+  }catch(e){channelMessage(id,e.message);}
+}
 async function monitorChannelAvailability(id,startedAt){
   let seen=false;
   for(let i=0;i<600;i++){
@@ -5859,6 +5916,7 @@ async function saveMultiExitChannel(id){
     inbound_port:parseInt(card.querySelector('[data-field=inbound_port]').value),
     protocol:card.querySelector('[data-field=protocol]').value,
     ip_type:card.querySelector('[data-field=ip_type]').value,
+    speed_auto:card.querySelector('[data-field=speed_auto]').checked,
     socks_enabled:socksEnabled,
     socks_port:socksPort,
     socks_username:card.querySelector('[data-field=socks_username]').value.trim(),
@@ -7977,6 +8035,7 @@ class Handler(BaseHTTPRequestHandler):
                     "id": channel_id, "name": channel_name,
                     "country": country, "inbound_port": port, "protocol": protocol,
                     "ip_type": ip_type, "enabled": True,
+                    "speed_auto": payload.get("speed_auto", updated.get("speed_auto", True)) is not False,
                     "socks_enabled": socks_enabled, "socks_port": socks_port,
                     "socks_username": socks_username, "socks_password": socks_password,
                 })
@@ -8130,6 +8189,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
 
+        if effective_path == "/api/speed_multi_exit_channel":
+            try:
+                payload = self.read_json_body()
+                channel_id = str(payload.get("channel_id") or "").strip()
+                self.send_json(request_channel_speed_test(channel_id))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+
         if effective_path == "/api/test_multi_exit_channel":
             try:
                 payload = self.read_json_body()
@@ -8212,6 +8280,7 @@ class Handler(BaseHTTPRequestHandler):
                         "id": cid, "name": str(item.get("name") or previous.get("name") or country + "线路")[:30],
                         "inbound_port": port, "country": country, "protocol": protocol,
                         "ip_type": ip_type, "enabled": bool(item.get("enabled", True)),
+                        "speed_auto": item.get("speed_auto", previous.get("speed_auto", True)) is not False,
                         "socks_enabled": socks_enabled, "socks_port": socks_port,
                         "socks_username": socks_username, "socks_password": socks_password,
                     })

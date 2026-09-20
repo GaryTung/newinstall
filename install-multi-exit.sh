@@ -11,7 +11,7 @@ fail() { printf '多国家出口安装失败：%s\n' "$*" >&2; exit 1; }
 [[ -x /usr/local/x-ui/x-ui && -f /etc/x-ui/x-ui.db ]] || fail "未检测到 3x-ui，请先执行统一安装器"
 [[ -f "${APP_DIR}/proxy_server.py" ]] || fail "未检测到节点管理系统"
 
-for file in multi_exit_manager.py xui_multi_provision.py channel_network.py channel_policy.py migrate_network_slots.py; do
+for file in multi_exit_manager.py xui_multi_provision.py channel_network.py channel_policy.py migrate_network_slots.py exit_speed.py; do
   [[ -f "${SCRIPT_DIR}/${file}" ]] || fail "安装包缺少 ${file}"
 done
 
@@ -23,9 +23,10 @@ modprobe tun 2>/dev/null || true
 install -d -o root -g root -m 0700 "${DATA_DIR}"
 existing_channels=0
 [[ ! -s "${CHANNEL_FILE}" ]] || existing_channels=1
-backup="/var/backups/aimilivpn/multi-install-42-$(date +%Y%m%d-%H%M%S)-$$"
+backup="/var/backups/aimilivpn/multi-install-43-$(date +%Y%m%d-%H%M%S)-$$"
 targets=(
   "${APP_DIR}/channel_network.py" "${APP_DIR}/channel_policy.py" "${APP_DIR}/migrate_network_slots.py"
+  "${APP_DIR}/exit_speed.py"
   /usr/local/sbin/aimilivpn-multiexit /usr/local/sbin/xui-multi-provision
   /etc/systemd/system/aimilivpn-multiexit.service
   "${CHANNEL_FILE}" "${DATA_DIR}/state.json" "${DATA_DIR}/deep_failures.json" "${DATA_DIR}/verified_exits.json"
@@ -83,6 +84,7 @@ done
 restore_ready=1
 install -o root -g root -m 0644 "${SCRIPT_DIR}/channel_network.py" "${APP_DIR}/channel_network.py"
 install -o root -g root -m 0644 "${SCRIPT_DIR}/channel_policy.py" "${APP_DIR}/channel_policy.py"
+install -o root -g root -m 0644 "${SCRIPT_DIR}/exit_speed.py" "${APP_DIR}/exit_speed.py"
 install -o root -g root -m 0755 "${SCRIPT_DIR}/migrate_network_slots.py" "${APP_DIR}/migrate_network_slots.py"
 install -o root -g root -m 0755 "${SCRIPT_DIR}/multi_exit_manager.py" /usr/local/sbin/aimilivpn-multiexit
 install -o root -g root -m 0755 "${SCRIPT_DIR}/xui_multi_provision.py" /usr/local/sbin/xui-multi-provision

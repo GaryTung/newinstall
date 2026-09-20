@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import base64
+from collections import OrderedDict
 import os
 import secrets
 import select
@@ -18,6 +19,200 @@ def parse_positive_int(value: str | None, default: int) -> int:
 
 MAX_PROXY_CONNECTIONS = parse_positive_int(os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS"), 256)
 proxy_connection_sem = threading.BoundedSemaphore(MAX_PROXY_CONNECTIONS)
+
+DNS_CACHE_MAX_ENTRIES = min(8192, parse_positive_int(os.environ.get("LOCAL_PROXY_DNS_CACHE_SIZE"), 1024))
+DNS_CACHE_MAX_TTL = min(3600, parse_positive_int(os.environ.get("LOCAL_PROXY_DNS_CACHE_TTL"), 300))
+
+
+class _DNSFlight:
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.address: str | None = None
+
+
+class _DNSCache:
+    """Process-local, bounded positive cache; never shared across VPN namespaces."""
+    def __init__(self, max_entries: int, max_ttl: int) -> None:
+        self.max_entries = max_entries
+        self.max_ttl = max_ttl
+        self.lock = threading.Lock()
+        self.scope: Any = None
+        self.entries: OrderedDict[Any, tuple[float, str]] = OrderedDict()
+        self.inflight: dict[Any, _DNSFlight] = {}
+
+    def _sync(self, scope: Any) -> None:
+        if self.scope != scope:
+            self.scope = scope
+            self.entries.clear()
+            for flight in self.inflight.values():
+                flight.event.set()
+            self.inflight.clear()
+
+    def _lookup(self, key: Any) -> str | None:
+        entry = self.entries.get(key)
+        if entry is not None:
+            if entry[0] > time.monotonic():
+                self.entries.move_to_end(key)
+                return entry[1]
+            self.entries.pop(key, None)
+        return None
+
+    def lookup(self, scope: Any, key: Any) -> str | None:
+        with self.lock:
+            self._sync(scope)
+            return self._lookup(key)
+
+    def begin(self, scope: Any, key: Any) -> tuple[str | None, _DNSFlight | None, bool]:
+        with self.lock:
+            self._sync(scope)
+            address = self._lookup(key)
+            if address is not None:
+                return address, None, False
+            if key in self.inflight:
+                return None, self.inflight[key], False
+            flight = _DNSFlight()
+            # Client concurrency is separately bounded; retain a hard limit here too.
+            if len(self.inflight) < self.max_entries:
+                self.inflight[key] = flight
+            return None, flight, True
+
+    def finish(self, scope: Any, key: Any, flight: _DNSFlight,
+               answer: tuple[str, int] | None, cacheable: bool) -> None:
+        with self.lock:
+            if self.scope == scope and self.inflight.get(key) is flight:
+                self.inflight.pop(key, None)
+                if cacheable and answer is not None and answer[1] > 0:
+                    self.entries[key] = (time.monotonic() + min(answer[1], self.max_ttl), answer[0])
+                    self.entries.move_to_end(key)
+                    while len(self.entries) > self.max_entries:
+                        self.entries.popitem(last=False)
+            flight.address = answer[0] if answer is not None else None
+            flight.event.set()
+
+    def clear(self) -> None:
+        with self.lock:
+            self._sync(None)
+
+
+_dns_cache = _DNSCache(DNS_CACHE_MAX_ENTRIES, DNS_CACHE_MAX_TTL)
+
+
+def _dns_cache_scope() -> tuple[Any, ...] | None:
+    """Cheap kernel reads invalidate a cached answer if tun0 is replaced/down/moved.
+
+    The daemon also restarts the namespace proxy on every VPN reconnect. This
+    fingerprint protects a still-running proxy when an interface changes in place.
+    No subprocess or DNS lookup is needed for a cache hit.
+    """
+    try:
+        import fcntl
+        import struct
+        namespace = os.stat("/proc/thread-self/ns/net")
+        index = socket.if_nametoindex("tun0")
+        request = struct.pack("256s", b"tun0")
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            flags = struct.unpack_from("H", fcntl.ioctl(probe.fileno(), 0x8913, request), 16)[0]
+            if not flags & 1:  # IFF_UP
+                return None
+            try:
+                address = fcntl.ioctl(probe.fileno(), 0x8915, request)[20:24]
+            except OSError:
+                address = b""
+        try:
+            with open("/proc/net/if_inet6", encoding="ascii") as source:
+                ipv6 = tuple(sorted(line.split()[0] for line in source if line.split()[-1:] == ["tun0"]))
+        except FileNotFoundError:  # IPv6 can be disabled on an otherwise healthy VPS.
+            ipv6 = ()
+        return os.getpid(), namespace.st_dev, namespace.st_ino, index, flags, address, ipv6
+    except (ImportError, OSError, ValueError):
+        # Unknown interface state must bypass, not reuse, a previous cache.
+        return None
+
+
+def _dns_host_key(host: str) -> str:
+    return host.rstrip(".").encode("idna").decode("ascii").lower()
+
+
+def _read_dns_name(packet: bytes, offset: int) -> tuple[str, int]:
+    labels = []
+    next_offset = None
+    visited = set()
+    for _ in range(128):
+        if offset >= len(packet) or offset in visited:
+            raise ValueError("Invalid DNS name")
+        visited.add(offset)
+        length = packet[offset]
+        if length & 0xC0 == 0xC0:
+            if offset + 1 >= len(packet):
+                raise ValueError("Truncated DNS pointer")
+            if next_offset is None:
+                next_offset = offset + 2
+            offset = ((length & 0x3F) << 8) | packet[offset + 1]
+            continue
+        if length & 0xC0 or offset + 1 + length > len(packet):
+            raise ValueError("Invalid DNS label")
+        offset += 1
+        if length == 0:
+            return ".".join(labels).lower(), next_offset if next_offset is not None else offset
+        labels.append(packet[offset:offset + length].decode("ascii"))
+        offset += length
+    raise ValueError("DNS name exceeds compression limit")
+
+
+def _parse_dns_answer(resp: bytes, tx_id: bytes, host: str, qtype: int) -> tuple[str, int] | None:
+    try:
+        if (len(resp) < 12 or resp[:2] != tx_id or not resp[2] & 0x80
+                or resp[2] & 0x7A or resp[3] & 0x0F or resp[4:6] != b"\x00\x01"):
+            return None
+        question, offset = _read_dns_name(resp, 12)
+        if question != host or resp[offset:offset + 4] != qtype.to_bytes(2, "big") + b"\x00\x01":
+            return None
+        offset += 4
+        addresses = {}
+        aliases = {}
+        for _ in range(int.from_bytes(resp[6:8], "big")):
+            name, offset = _read_dns_name(resp, offset)
+            if offset + 10 > len(resp):
+                return None
+            atype = int.from_bytes(resp[offset:offset + 2], "big")
+            aclass = int.from_bytes(resp[offset + 2:offset + 4], "big")
+            ttl = int.from_bytes(resp[offset + 4:offset + 8], "big")
+            if ttl & 0x80000000:  # RFC 2181: high-bit TTLs are treated as zero.
+                ttl = 0
+            size = int.from_bytes(resp[offset + 8:offset + 10], "big")
+            offset += 10
+            end = offset + size
+            if end > len(resp):
+                return None
+            if aclass == 1:
+                if atype == 5:
+                    alias, name_end = _read_dns_name(resp, offset)
+                    if name_end != end:
+                        return None
+                    aliases[name] = (alias, ttl)
+                elif atype == qtype and ((qtype == 1 and size == 4) or (qtype == 28 and size == 16)):
+                    family = socket.AF_INET if qtype == 1 else socket.AF_INET6
+                    if name in addresses:
+                        old_address, old_ttl = addresses[name]
+                        addresses[name] = (old_address, min(old_ttl, ttl))
+                    else:
+                        addresses[name] = (socket.inet_ntop(family, resp[offset:end]), ttl)
+            offset = end
+        visited = set()
+        name = host
+        ttl_limit = 0x7FFFFFFF
+        while name not in visited:
+            visited.add(name)
+            if name in addresses:
+                address, ttl = addresses[name]
+                return address, min(ttl, ttl_limit)
+            if name not in aliases:
+                return None
+            name, ttl = aliases[name]
+            ttl_limit = min(ttl_limit, ttl)
+    except (OSError, ValueError, UnicodeError):
+        return None
+    return None
 
 def parse_int(value: Any) -> int:
     try:
@@ -84,11 +279,13 @@ def check_credentials(username: str | None, password: str | None) -> bool:
         return True
     return secrets.compare_digest(username or "", expected_user) and secrets.compare_digest(password or "", expected_pass)
 
-def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) -> str | None:
-    import random
+def _query_dns_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) -> tuple[str, int] | None:
     sock = None
     try:
-        tx_id = random.getrandbits(16).to_bytes(2, "big")
+        host = _dns_host_key(host)
+        if not host or len(host) > 253 or qtype not in (1, 28):
+            return None
+        tx_id = secrets.token_bytes(2)
         flags = b"\x01\x00"
         questions = b"\x00\x01"
         rrs = b"\x00\x00\x00\x00\x00\x00"
@@ -96,7 +293,7 @@ def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) 
         qname = b""
         for part in host.split("."):
             if not part:
-                continue
+                return None
             part_bytes = part.encode("idna")
             if len(part_bytes) > 63:
                 return None
@@ -116,8 +313,10 @@ def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) 
             elif "no such device" in str(e).lower() or e.errno == 19:
                 print("[DNS 绑定失败] [错误代码 3004] DNS 解析绑定 tun0 失败，网卡设备不存在，请检查 VPN 连接！", flush=True)
             return None
-        sock.sendto(packet, (dns_server, 53))
-        resp, _ = sock.recvfrom(4096)
+        # A connected UDP socket only accepts replies from the chosen resolver.
+        sock.connect((dns_server, 53))
+        sock.send(packet)
+        resp = sock.recv(4096)
     except Exception:
         return None
     finally:
@@ -127,56 +326,34 @@ def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) 
             except Exception:
                 pass
 
+    return _parse_dns_answer(resp, tx_id, host, qtype)
+
+
+def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) -> str | None:
     try:
-        if len(resp) < 12 or resp[:2] != tx_id:
-            return None
-        rcode = resp[3] & 0x0F
-        if rcode != 0:
-            return None
-
-        offset = 12
-        while offset < len(resp):
-            length = resp[offset]
-            if length == 0:
-                offset += 1
-                break
-            if (length & 0xC0) == 0xC0:
-                offset += 2
-                break
-            offset += 1 + length
-
-        offset += 4
-        answers_count = int.from_bytes(resp[6:8], "big")
-        for _ in range(answers_count):
-            if offset >= len(resp):
-                break
-            while offset < len(resp):
-                length = resp[offset]
-                if length == 0:
-                    offset += 1
-                    break
-                if (length & 0xC0) == 0xC0:
-                    offset += 2
-                    break
-                offset += 1 + length
-            if offset + 10 > len(resp):
-                break
-            atype = int.from_bytes(resp[offset : offset + 2], "big")
-            aclass = int.from_bytes(resp[offset + 2 : offset + 4], "big")
-            rdlength = int.from_bytes(resp[offset + 8 : offset + 10], "big")
-            offset += 10
-            if offset + rdlength > len(resp):
-                break
-            record = resp[offset : offset + rdlength]
-            if atype == qtype and aclass == 1:
-                if qtype == 1 and rdlength == 4:
-                    return socket.inet_ntoa(record)
-                if qtype == 28 and rdlength == 16:
-                    return socket.inet_ntop(socket.AF_INET6, record)
-            offset += rdlength
-    except Exception:
+        host = _dns_host_key(host)
+    except (UnicodeError, ValueError):
         return None
-    return None
+    scope = _dns_cache_scope()
+    if scope is None:
+        _dns_cache.clear()
+        answer = _query_dns_over_tun0(host, qtype, dns_server, timeout)
+        return answer[0] if answer is not None else None
+    key = (host, qtype, dns_server)
+    address, flight, owner = _dns_cache.begin(scope, key)
+    if address is not None:
+        return address
+    if not owner:
+        # Coalesce a burst of browser lookups without holding the cache lock.
+        if flight.event.wait(max(0.0, timeout) + 0.25) and _dns_cache_scope() == scope:
+            return flight.address
+        return None
+    answer = None
+    try:
+        answer = _query_dns_over_tun0(host, qtype, dns_server, timeout)
+        return answer[0] if answer is not None else None
+    finally:
+        _dns_cache.finish(scope, key, flight, answer, _dns_cache_scope() == scope)
 
 def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float = 3.0) -> str | None:
     try:
@@ -189,6 +366,19 @@ def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float
         return host
     except OSError:
         pass
+    try:
+        key = _dns_host_key(host)
+    except (UnicodeError, ValueError):
+        return None
+    scope = _dns_cache_scope()
+    if scope is not None:
+        # An AAAA cache hit must not repeat an earlier unsuccessful A request.
+        for qtype in (1, 28):
+            cached = _dns_cache.lookup(scope, (key, qtype, dns_server))
+            if cached is not None:
+                return cached
+    else:
+        _dns_cache.clear()
     return dns_query_over_tun0(host, 1, dns_server, timeout) or dns_query_over_tun0(host, 28, dns_server, timeout)
 
 def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
