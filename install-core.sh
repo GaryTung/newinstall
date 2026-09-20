@@ -18,11 +18,35 @@ fail() {
   exit 1
 }
 
+initialize_environment_file() {
+  # An existing EnvironmentFile is operator-owned. Never source or rewrite it:
+  # it can contain emergency pause flags, custom data paths and resource limits.
+  if [[ -e "${ENV_FILE}" || -L "${ENV_FILE}" ]]; then
+    [[ -f "${ENV_FILE}" && -r "${ENV_FILE}" ]] || fail "已有环境配置不是可读文件：${ENV_FILE}"
+    printf '%s\n' "保留已有运行环境配置 ${ENV_FILE}（包括暂停状态及低并发参数）。"
+    return
+  fi
+  # noclobber also protects a file created after the existence check.
+  (
+    umask 077
+    set -o noclobber
+    cat > "${ENV_FILE}" <<EOF
+VPNGATE_DATA_DIR=${DATA_DIR}
+UI_HOST=${UI_HOST}
+UI_PORT=${UI_PORT}
+LOCAL_PROXY_HOST=${PROXY_HOST}
+LOCAL_PROXY_PORT=${PROXY_PORT}
+PYTHONUNBUFFERED=1
+EOF
+  )
+  chmod 0600 "${ENV_FILE}"
+}
+
 if [[ "${EUID}" -ne 0 ]]; then
   fail "请使用 sudo bash install.sh 运行。"
 fi
 
-for file in vpngate_manager.py vpn_utils.py proxy_server.py channel_network.py channel_policy.py exit_speed.py; do
+for file in vpngate_manager.py vpn_utils.py proxy_server.py channel_network.py channel_policy.py resource_guard.py; do
   [[ -f "${SCRIPT_DIR}/${file}" ]] || fail "安装包缺少 ${file}"
 done
 
@@ -66,13 +90,13 @@ PYTHONPYCACHEPREFIX="${cache_dir}" python3 -m py_compile \
   "${SCRIPT_DIR}/proxy_server.py" \
   "${SCRIPT_DIR}/channel_network.py" \
   "${SCRIPT_DIR}/channel_policy.py" \
-  "${SCRIPT_DIR}/exit_speed.py"
+  "${SCRIPT_DIR}/resource_guard.py"
 
 backup_dir=""
 if [[ -f "${APP_DIR}/vpngate_manager.py" ]]; then
   backup_dir="/var/backups/aimilivpn/$(date +%Y%m%d-%H%M%S)"
   install -d -o root -g root -m 0700 "${backup_dir}"
-  for file in vpngate_manager.py vpn_utils.py proxy_server.py channel_network.py channel_policy.py exit_speed.py; do
+  for file in vpngate_manager.py vpn_utils.py proxy_server.py channel_network.py channel_policy.py resource_guard.py; do
     [[ -f "${APP_DIR}/${file}" ]] && cp -p -- "${APP_DIR}/${file}" "${backup_dir}/${file}"
   done
 fi
@@ -84,7 +108,7 @@ install -o root -g root -m 0755 "${SCRIPT_DIR}/vpn_utils.py" "${APP_DIR}/vpn_uti
 install -o root -g root -m 0755 "${SCRIPT_DIR}/proxy_server.py" "${APP_DIR}/proxy_server.py"
 install -o root -g root -m 0644 "${SCRIPT_DIR}/channel_network.py" "${APP_DIR}/channel_network.py"
 install -o root -g root -m 0644 "${SCRIPT_DIR}/channel_policy.py" "${APP_DIR}/channel_policy.py"
-install -o root -g root -m 0644 "${SCRIPT_DIR}/exit_speed.py" "${APP_DIR}/exit_speed.py"
+install -o root -g root -m 0644 "${SCRIPT_DIR}/resource_guard.py" "${APP_DIR}/resource_guard.py"
 if [[ -f "${SCRIPT_DIR}/LICENSE" ]]; then
   install -o root -g root -m 0644 "${SCRIPT_DIR}/LICENSE" "${APP_DIR}/LICENSE"
 fi
@@ -106,15 +130,7 @@ else
   printf '%s\n' '检测到已有数据，保留原账号、页面路径、收藏和路由设置。'
 fi
 
-cat > "${ENV_FILE}" <<EOF
-VPNGATE_DATA_DIR=${DATA_DIR}
-UI_HOST=${UI_HOST}
-UI_PORT=${UI_PORT}
-LOCAL_PROXY_HOST=${PROXY_HOST}
-LOCAL_PROXY_PORT=${PROXY_PORT}
-PYTHONUNBUFFERED=1
-EOF
-chmod 0600 "${ENV_FILE}"
+initialize_environment_file
 
 printf '%s\n' '[5/7] 创建系统服务和管理命令...'
 cat > "${SERVICE_FILE}" <<EOF
@@ -149,7 +165,7 @@ if ! systemctl is-active --quiet "${APP_NAME}.service"; then
   journalctl -u "${APP_NAME}.service" -n 80 --no-pager >&2 || true
   if [[ -n "${backup_dir}" ]]; then
     printf '%s\n' '正在恢复升级前版本...' >&2
-    for file in vpngate_manager.py vpn_utils.py proxy_server.py channel_network.py channel_policy.py exit_speed.py; do
+    for file in vpngate_manager.py vpn_utils.py proxy_server.py channel_network.py channel_policy.py resource_guard.py; do
       [[ -f "${backup_dir}/${file}" ]] && install -o root -g root -m 0755 "${backup_dir}/${file}" "${APP_DIR}/${file}"
     done
     systemctl restart "${APP_NAME}.service" || true

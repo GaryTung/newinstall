@@ -81,6 +81,7 @@ class DualStackHTTPServer(ThreadingHTTPServer):
 
 import vpn_utils
 import proxy_server
+import resource_guard
 from channel_network import ensure_network_slots
 from channel_policy import candidate_rejection, effective_ip_type, failure_record, ip_type_rank
 
@@ -151,6 +152,8 @@ MULTI_RECOVERY_FAILURE_GRACE_SECONDS = env_int("MULTI_RECOVERY_FAILURE_GRACE_SEC
 MULTI_RECOVERY_COUNTRY_RECHECK_SECONDS = env_int("MULTI_RECOVERY_COUNTRY_RECHECK_SECONDS", 5 * 60, 60, 3600)
 MULTI_RECOVERY_CATALOG_REFRESH_SECONDS = env_int("MULTI_RECOVERY_CATALOG_REFRESH_SECONDS", 10 * 60, 120, 7200)
 CONFIG_CACHE_RETENTION_SECONDS = env_int("CONFIG_CACHE_RETENTION_SECONDS", 3 * 24 * 3600, 24 * 3600)
+BACKGROUND_PAUSED = os.environ.get("VPNGATE_BACKGROUND_PAUSED", "").strip().lower() in {"1", "true", "yes", "on"}
+BACKGROUND_PAUSED_MESSAGE = "后台维护已暂停：仅保留登录、查看、复制链接和总订阅；节点拉取、检测及配置修改暂不可用。现有独立出口继续运行。"
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
@@ -286,7 +289,7 @@ def get_direct_node_status() -> dict[str, Any]:
         ).stdout.strip() == "active"
         result["status"] = "connected" if active and result["routing"] == "direct" else "misconfigured"
         now = time.time()
-        if now - float(_direct_ip_cache["time"]) > 3600 or not _direct_ip_cache["value"]:
+        if not BACKGROUND_PAUSED and (now - float(_direct_ip_cache["time"]) > 3600 or not _direct_ip_cache["value"]):
             try:
                 with urllib.request.urlopen("https://api.ipify.org", timeout=4) as response:
                     value = response.read(80).decode("ascii", "ignore").strip()
@@ -295,6 +298,11 @@ def get_direct_node_status() -> dict[str, Any]:
             except Exception:
                 pass
         result["exit_ip"] = _direct_ip_cache["value"]
+        if BACKGROUND_PAUSED and not result["exit_ip"]:
+            try:
+                result["exit_ip"] = (DATA_DIR / "public_ip.txt").read_text(encoding="utf-8").strip()
+            except OSError:
+                pass
     except Exception as exc:
         result["error"] = str(exc)
     return result
@@ -471,6 +479,176 @@ def normalize_hysteria2_client_tls(value: str, kind: str, public_host: str) -> s
     return value[:section.start()] + replacement + value[section.end():]
 
 
+def normalize_ip_literal_client_tls(value: str, kind: str, public_host: str) -> str:
+    """Fix IP Trojan/VLESS TLS exports without weakening TLS or editing REALITY.
+
+    Inspect the actual node address, not the subscription host. Domain nodes,
+    credentials and pins stay intact. Only x-ui's block-style YAML is handled;
+    ambiguous YAML is left unchanged rather than partially reinterpreted.
+    """
+    import ipaddress
+
+    def literal_ip(host: str) -> str:
+        try:
+            return str(ipaddress.ip_address(host.strip().strip("[]")))
+        except ValueError:
+            return ""
+
+    if kind == "universal":
+        output: list[str] = []
+        for line in value.splitlines(keepends=True):
+            body = line.rstrip("\r\n")
+            ending = line[len(body):]
+            try:
+                parsed = urllib.parse.urlsplit(body.strip())
+                address = literal_ip(parsed.hostname or "")
+            except ValueError:
+                output.append(line)
+                continue
+            protocol = parsed.scheme.casefold()
+            if protocol not in {"trojan", "vless"} or not address:
+                output.append(line)
+                continue
+            tokens = parsed.query.split("&") if parsed.query else []
+            pairs = [
+                (urllib.parse.unquote_plus(token.partition("=")[0]).casefold(),
+                 urllib.parse.unquote_plus(token.partition("=")[2]))
+                for token in tokens
+            ]
+            security = [item.casefold() for key, item in pairs if key == "security"]
+            if (security and any(item != "tls" for item in security)) or (protocol == "vless" and not security):
+                output.append(line)
+                continue
+            has_sni = any(key == "sni" and item.strip() for key, item in pairs)
+            kept = [token for token, (key, _) in zip(tokens, pairs)
+                    if key != "ech" and (has_sni or key != "sni")]
+            if not has_sni:
+                kept.append("sni=" + urllib.parse.quote(address, safe=""))
+            normalized = urllib.parse.urlunsplit((
+                parsed.scheme, parsed.netloc, parsed.path, "&".join(kept), parsed.fragment,
+            ))
+            prefix = body[:len(body) - len(body.lstrip())]
+            suffix = body[len(body.rstrip()):]
+            output.append(prefix + normalized + suffix + ending)
+        return "".join(output)
+
+    if kind != "clash":
+        return value
+
+    def yaml_scalar(text: str) -> str | None:
+        text = text.strip()
+        if text.startswith('"'):
+            try:
+                scalar, end = json.JSONDecoder().raw_decode(text)
+                rest = text[end:]
+                return scalar if isinstance(scalar, str) and (not rest.strip() or rest.lstrip().startswith("#")) else None
+            except ValueError:
+                return None
+        if text.startswith("'"):
+            match = re.fullmatch(r"'((?:[^']|'')*)'\s*(?:#.*)?", text)
+            return match.group(1).replace("''", "'") if match else None
+        text = re.sub(r"\s+#.*$", "", text).strip()
+        if text.startswith(("{", "[", "&", "*", "!", "|", ">")):
+            return None
+        return text
+
+    def clean_proxy_block(block: list[str]) -> list[str]:
+        if any("\t" in line[:len(line) - len(line.lstrip())] for line in block):
+            return block
+        first = re.match(r"^( *)- +([\w-]+):", block[0])
+        if not first or first.group(2).casefold() in {"ech", "ech-opts"}:
+            return block
+        indent = first.start(2)
+        # Anchors/merges, block scalars and indentation-less sequences require
+        # a complete YAML parser; deleting their defining field could break
+        # references or change the structure of an unrelated setting.
+        if any(re.match(r"^ *(?:- +)?(?:[\w-]+|<<):[ \t]*[&*!|>]", line)
+               for line in block):
+            return block
+        if any(re.match(r"^ {" + str(indent) + r"}-[ \t]", line) for line in block[1:]):
+            return block
+        fields: dict[str, tuple[int, str]] = {}
+        duplicate = False
+        for index, line in enumerate(block):
+            source = " " * indent + line[first.start(2):] if index == 0 else line
+            match = re.match(r"^( *)([\w-]+):(?:[ \t]*(.*))?$", source.rstrip("\r\n"))
+            if not match or len(match.group(1)) != indent:
+                continue
+            key = match.group(2).casefold()
+            if key in fields:
+                duplicate = True
+            fields[key] = (index, match.group(3) or "")
+        if duplicate or "type" not in fields or "server" not in fields or "reality-opts" in fields:
+            return block
+        protocol = yaml_scalar(fields["type"][1])
+        server = yaml_scalar(fields["server"][1])
+        address = literal_ip(server or "")
+        if protocol not in {"trojan", "vless"} or not address:
+            return block
+        tls = yaml_scalar(fields["tls"][1]) if "tls" in fields else None
+        if ("tls" in fields and tls not in {"true", "True", "TRUE"}) or (protocol == "vless" and tls is None):
+            return block
+        if "security" in fields and yaml_scalar(fields["security"][1]) != "tls":
+            return block
+        sni_fields = [fields[key] for key in ("sni", "servername") if key in fields]
+        if any(yaml_scalar(raw) is None for _, raw in sni_fields):
+            return block
+        has_sni = any(yaml_scalar(raw) for _, raw in sni_fields)
+        removed: set[int] = set()
+        for key in ("ech", "ech-opts"):
+            if key not in fields:
+                continue
+            index = fields[key][0]
+            removed.add(index)
+            cursor = index + 1
+            while cursor < len(block):
+                child = block[cursor]
+                if child.strip() and len(child) - len(child.lstrip(" ")) <= indent:
+                    break
+                removed.add(cursor)
+                cursor += 1
+        if not has_sni:
+            removed.update(index for index, _ in sni_fields)
+        output = []
+        for index, line in enumerate(block):
+            if index in removed:
+                continue
+            output.append(line)
+            if not has_sni and index == fields["server"][0]:
+                ending = "\r\n" if line.endswith("\r\n") else "\n"
+                if not line.endswith("\n"):
+                    output[-1] += ending
+                key = "sni" if protocol == "trojan" else "servername"
+                output.append(" " * indent + key + ": " + json.dumps(address) + ending)
+        return output
+
+    lines = value.splitlines(keepends=True)
+    start = next((index + 1 for index, line in enumerate(lines)
+                  if re.fullmatch(r"proxies:\s*(?:#.*)?", line.rstrip("\r\n"))), None)
+    if start is None:
+        return value
+    end = start
+    while end < len(lines):
+        line = lines[end]
+        if line.strip() and not line.startswith((" ", "-", "#", "\t")):
+            break
+        end += 1
+    starts = []
+    list_indent = None
+    for index in range(start, end):
+        match = re.match(r"^( *)- +[\w-]+:", lines[index])
+        if match and (list_indent is None or len(match.group(1)) == list_indent):
+            list_indent = len(match.group(1))
+            starts.append(index)
+    if not starts:
+        return value
+    cleaned = lines[:starts[0]]
+    for position, index in enumerate(starts):
+        stop = starts[position + 1] if position + 1 < len(starts) else end
+        cleaned.extend(clean_proxy_block(lines[index:stop]))
+    return "".join(cleaned + lines[end:])
+
+
 def xui_node_content(sub_id: str, kind: str, public_host: str, display_name: str = "") -> str:
     """Read one node from x-ui locally while making it emit the public server address."""
     if not sub_id or kind not in ("universal", "clash"):
@@ -503,6 +681,7 @@ def xui_node_content(sub_id: str, kind: str, public_host: str, display_name: str
     value = value.replace("@localhost:", f"@{public_host}:")
     value = rewrite_xui_node_name(value, kind, display_name)
     value = normalize_hysteria2_client_tls(value, kind, public_host)
+    value = normalize_ip_literal_client_tls(value, kind, public_host)
     _xui_content_cache[cache_key] = (time.time(), value)
     return value
 
@@ -609,22 +788,6 @@ def wake_multi_exit_service() -> None:
         ["systemctl", "kill", "--kill-whom=main", "--signal=SIGUSR1", "aimilivpn-multiexit.service"],
         check=False, capture_output=True, text=True, timeout=5,
     )
-
-
-def request_channel_speed_test(channel_id: str) -> dict[str, Any]:
-    """Queue a speed comparison without restarting any live tunnel."""
-    with multi_config_lock:
-        config = read_multi_exit_config()
-        index, channel = find_multi_channel(config, channel_id)
-        if not channel.get("enabled", True):
-            raise ValueError("请先启用该国家线路")
-        channel["speed_auto"] = True
-        channel["preferred_node_id"] = ""
-        channel["speed_request_token"] = time.time()
-        config["channels"][index] = channel
-        write_json(MULTI_EXIT_DIR / "channels.json", config)
-    wake_multi_exit_service()
-    return {"ok": True, "running": True, "message": "已排队测速并自动择优；已解除手动 IP 固定，测速期间保留当前连接，仅比较符合本线路策略的出口。"}
 
 
 def channel_candidate_nodes(channel: dict[str, Any], source: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
@@ -736,13 +899,9 @@ def mark_channel_ready(channel_id: str, preferred_node_id: str = "") -> None:
         write_json(MULTI_EXIT_DIR / "channels.json", config)
 
 
-def multi_exit_payload() -> dict[str, Any]:
+def multi_exit_payload(read_only: bool = False) -> dict[str, Any]:
     config = read_multi_exit_config()
     runtime = read_json(MULTI_EXIT_DIR / "state.json", {"channels": {}})
-    speed_results = read_json(MULTI_EXIT_DIR / "speed_results.json", {})
-    speed_channels = speed_results.get("channels", {}) if isinstance(speed_results, dict) else {}
-    if not isinstance(speed_channels, dict):
-        speed_channels = {}
     result = read_json(Path("/etc/x-ui/multi-exit-result.json"), {"channels": []})
     subscriptions = {str(item.get("id") or ""): item for item in result.get("channels", [])}
     host = public_subscription_host()
@@ -751,10 +910,12 @@ def multi_exit_payload() -> dict[str, Any]:
         source_nodes = read_nodes()
     provider_probes: list[dict[str, Any]] = []
     for state in runtime_channels.values():
+        for obsolete in ("speed_switch_at", "speed_request_applied", "speed_switch_reason"):
+            state.pop(obsolete, None)
         exit_ip = str(state.get("exit_ip") or "")
         if exit_ip:
             provider_probes.append({"ip": exit_ip})
-    if provider_probes:
+    if provider_probes and not read_only:
         vpn_utils.enrich_ip_info(provider_probes)
     providers = {
         str(item.get("ip") or ""): str(item.get("owner") or item.get("as_name") or "")
@@ -762,9 +923,9 @@ def multi_exit_payload() -> dict[str, Any]:
     }
     for channel in config.get("channels", []):
         cid = str(channel.get("id") or "")
-        channel["speed_auto"] = channel.get("speed_auto", True) is not False
-        speed_test = speed_channels.get(cid, {})
-        channel["speed_test"] = speed_test if isinstance(speed_test, dict) else {}
+        # Ignore stale .43 benchmark settings; they must never re-enable work.
+        for obsolete in ("speed_auto", "speed_request_token", "speed_test"):
+            channel.pop(obsolete, None)
         channel["candidates"] = channel_candidate_nodes(channel, source_nodes)
         state = runtime_channels.get(cid, {})
         current = next((node for node in channel["candidates"] if node.get("id") == state.get("node_id")), {})
@@ -799,6 +960,7 @@ def multi_exit_payload() -> dict[str, Any]:
             direct["node_content_error"] = str(exc)
     main_state = read_json(STATE_FILE, {})
     maintenance = {
+        "background_paused": read_only,
         "running": bool(maintenance_lock.locked()),
         "task": str(main_state.get("maintenance_task") or ""),
         "channel_id": str(main_state.get("maintenance_channel_id") or ""),
@@ -1442,6 +1604,10 @@ def get_state() -> dict[str, Any]:
     state.setdefault("last_check_message", "")
     state.setdefault("blacklisted_nodes", 0)
     state["metadata_refresh_paused"] = metadata_refresh_paused()
+    state["background_paused"] = BACKGROUND_PAUSED
+    if BACKGROUND_PAUSED:
+        state["metadata_refresh_paused"] = True
+        state["last_check_message"] = BACKGROUND_PAUSED_MESSAGE
 
     # Pre-populate settings inputs in UI
     ui_cfg = load_ui_config()
@@ -1548,6 +1714,34 @@ def read_socks5_connect_reply(sock: socket.socket) -> None:
 def format_host_port(host: str, port: int) -> str:
     return f"[{host}]:{port}" if ":" in host and not host.startswith("[") else f"{host}:{port}"
 
+CATALOG_RESPONSE_MAX_BYTES = 8 * 1024 * 1024
+CATALOG_RESPONSE_MAX_HEADER_BYTES = 64 * 1024
+
+
+class CatalogResponseTooLarge(CatalogRefreshCancelled):
+    pass
+
+
+def check_catalog_content_length(value: str | None) -> None:
+    """Content-Length is an early warning, never a substitute for read limits."""
+    try:
+        declared_length = int(value or "")
+    except (TypeError, ValueError):
+        return
+    if declared_length > CATALOG_RESPONSE_MAX_BYTES:
+        raise CatalogResponseTooLarge("节点资料响应超过 8 MiB 安全上限，已拒绝该来源；现有节点目录保留")
+
+
+def read_bounded_catalog_response(response) -> str:
+    check_catalog_content_length(response.headers.get("Content-Length"))
+    # This also bounds chunked/no-length/dishonest responses before decoding
+    # or CSV allocation. The extra byte detects an over-limit body.
+    body = response.read(CATALOG_RESPONSE_MAX_BYTES + 1)
+    if len(body) > CATALOG_RESPONSE_MAX_BYTES:
+        raise CatalogResponseTooLarge("节点资料响应超过 8 MiB 安全上限，已拒绝该来源；现有节点目录保留")
+    return body.decode("utf-8", errors="replace")
+
+
 def fetch_api_text_via_proxy(url: str, ptype: str, phost: str, pport: int, use_ssl_verify: bool = True) -> str:
     import socket
     import ssl
@@ -1638,19 +1832,33 @@ def fetch_api_text_via_proxy(url: str, ptype: str, phost: str, pport: int, use_s
 
         # Read response with an absolute deadline. A peer sending a few bytes at
         # a time must not hold the whole node-management lock for minutes.
-        response_data = b""
+        response_data = bytearray()
+        response_header_checked = False
         read_deadline = time.monotonic() + 30
         while True:
             remaining = read_deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("VPN Gate response timed out after 30 seconds")
             s.settimeout(min(12, max(1, remaining)))
-            chunk = s.recv(4096)
+            chunk = s.recv(min(4096, CATALOG_RESPONSE_MAX_BYTES + 1 - len(response_data)))
             if not chunk:
                 break
             response_data += chunk
-            if len(response_data) > 10 * 1024 * 1024: # max 10MB safety guard
-                break
+            if len(response_data) > CATALOG_RESPONSE_MAX_BYTES:
+                raise CatalogResponseTooLarge("节点资料响应超过 8 MiB 安全上限，已拒绝该来源；现有节点目录保留")
+            if not response_header_checked:
+                header_end = response_data.find(b"\r\n\r\n")
+                if header_end == -1:
+                    if len(response_data) > CATALOG_RESPONSE_MAX_HEADER_BYTES:
+                        raise RuntimeError("节点资料 HTTP 响应头超过 64 KiB 安全上限")
+                else:
+                    if header_end > CATALOG_RESPONSE_MAX_HEADER_BYTES:
+                        raise RuntimeError("节点资料 HTTP 响应头超过 64 KiB 安全上限")
+                    for header in response_data[:header_end].decode("ascii", errors="replace").splitlines()[1:]:
+                        key, separator, value = header.partition(":")
+                        if separator and key.strip().lower() == "content-length":
+                            check_catalog_content_length(value.strip())
+                    response_header_checked = True
     finally:
         if s is not None:
             try:
@@ -1664,7 +1872,7 @@ def fetch_api_text_via_proxy(url: str, ptype: str, phost: str, pport: int, use_s
         raise RuntimeError("Invalid HTTP response format")
 
     headers_part = response_data[:header_end].decode('utf-8', errors='replace')
-    body_part = response_data[header_end+4:]
+    body_part = bytes(response_data[header_end+4:])
 
     # Check for HTTP status code
     lines = headers_part.splitlines()
@@ -1719,6 +1927,10 @@ def fetch_api_text(url: str | None = None, use_ssl_verify: bool = True) -> str:
         try:
             print(f"[fetch_api_text] 监测到上游代理 ({ptype}://{phost}:{pport})，尝试通过代理获取 API...", flush=True)
             return fetch_api_text_via_proxy(url, ptype, phost, pport, use_ssl_verify)
+        except CatalogResponseTooLarge:
+            # Repeating a rejected oversized source via another route doubles
+            # resource consumption and cannot make its content safe.
+            raise
         except Exception as e:
             print(f"[fetch_api_text] 通过代理获取 API 失败: {e}，尝试使用直连/默认系统代理...", flush=True)
             log_to_json("WARNING", "Main", f"使用代理 {ptype}://{phost}:{pport} 获取 API 失败: {e}")
@@ -1734,10 +1946,10 @@ def fetch_api_text(url: str | None = None, use_ssl_verify: bool = True) -> str:
         import ssl
         ctx = ssl._create_unverified_context()
         with urllib.request.urlopen(request, timeout=12, context=ctx) as response:
-            return response.read().decode("utf-8", errors="replace")
+            return read_bounded_catalog_response(response)
     else:
         with urllib.request.urlopen(request, timeout=12) as response:
-            return response.read().decode("utf-8", errors="replace")
+            return read_bounded_catalog_response(response)
 
 def parse_vpngate_rows(text: str) -> list[dict[str, str]]:
     lines = [line for line in text.splitlines() if line and not line.startswith("*")]
@@ -1889,6 +2101,9 @@ def fetch_mirror_api_urls() -> list[str]:
 def fetch_candidates(aggregate_all_sources: bool = False) -> list[dict[str, Any]]:
     if metadata_cancel_event.is_set():
         raise CatalogRefreshCancelled("节点资料拉取已停止")
+    allowed, reason = resource_guard.background_work_allowed()
+    if not allowed:
+        raise CatalogRefreshCancelled(reason)
     blacklist = load_blacklist()
     candidates: list[dict[str, Any]] = []
     seen_ips = set()
@@ -1912,6 +2127,9 @@ def fetch_candidates(aggregate_all_sources: bool = False) -> list[dict[str, Any]
         nonlocal last_err
         if metadata_cancel_event.is_set():
             raise CatalogRefreshCancelled("节点资料拉取已停止")
+        allowed, reason = resource_guard.background_work_allowed()
+        if not allowed:
+            raise CatalogRefreshCancelled(reason)
         before = len(candidates)
         try:
             msg = f"尝试拉取 {url} (SSL验证: {verify_ssl})..."
@@ -1973,7 +2191,7 @@ def fetch_candidates(aggregate_all_sources: bool = False) -> list[dict[str, Any]
         mirror_urls = fetch_mirror_api_urls()
         if aggregate_all_sources:
             print(f"[fetch_candidates] 正在并发聚合 {len(mirror_urls)} 个官方镜像，以获取完整国家节点列表。", flush=True)
-            executor = concurrent.futures.ThreadPoolExecutor(max_workers=min(VPNGATE_MIRROR_WORKERS, max(1, len(mirror_urls))))
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=min(resource_guard.recommended_probe_workers(VPNGATE_MIRROR_WORKERS), max(1, len(mirror_urls))))
             try:
                 futures = [
                     executor.submit(ingest_source, mirror_url, mirror_url.lower().startswith("https://"))
@@ -2136,16 +2354,37 @@ def stop_process(process: subprocess.Popen[str] | None) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
 
+def is_owned_main_openvpn(proc_dir: Path) -> bool:
+    """Only the main manager's own namespace/config may be cleaned up.
+
+    Country tunnels share AUTH_FILE, so an authentication filename never
+    establishes process ownership. Re-check immediately before each signal.
+    """
+    try:
+        args = [part.decode("utf-8", errors="replace")
+                for part in (proc_dir / "cmdline").read_bytes().split(b"\0") if part]
+        if not args or Path(args[0]).name != "openvpn":
+            return False
+        if os.readlink(proc_dir / "ns/net") != os.readlink("/proc/self/ns/net"):
+            return False
+        config = ""
+        for index, arg in enumerate(args[1:], 1):
+            if arg == "--config" and index + 1 < len(args):
+                config = args[index + 1]
+            elif arg.startswith("--config="):
+                config = arg.split("=", 1)[1]
+        path = Path(config)
+        if not config or not path.is_absolute() or path.suffix != ".ovpn":
+            return False
+        return path.resolve().is_relative_to(CONFIG_DIR.resolve())
+    except (OSError, ValueError):
+        return False
+
+
 def kill_existing_openvpn_processes() -> None:
     if not sys.platform.startswith("linux"):
         return
     try:
-        own_markers = [
-            str(DATA_DIR),
-            str(CONFIG_DIR),
-            str(AUTH_FILE),
-            str(UPSTREAM_PROXY_AUTH_FILE),
-        ]
         killed_pids: list[int] = []
         proc_root = Path("/proc")
         if not proc_root.exists():
@@ -2156,20 +2395,7 @@ def kill_existing_openvpn_processes() -> None:
             pid = int(proc_dir.name)
             if pid == os.getpid():
                 continue
-            try:
-                raw = (proc_dir / "cmdline").read_bytes()
-            except OSError:
-                continue
-            if not raw:
-                continue
-            args = [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
-            if not args:
-                continue
-            cmdline = " ".join(args)
-            executable = Path(args[0]).name.lower()
-            if "openvpn" not in executable and "openvpn" not in cmdline.lower():
-                continue
-            if any(marker and marker in cmdline for marker in own_markers):
+            if is_owned_main_openvpn(proc_dir):
                 try:
                     os.kill(pid, signal.SIGTERM)
                     killed_pids.append(pid)
@@ -2181,9 +2407,7 @@ def kill_existing_openvpn_processes() -> None:
             time.sleep(0.5)
             for pid in killed_pids:
                 try:
-                    raw = (proc_root / str(pid) / "cmdline").read_bytes()
-                    cmdline = " ".join(part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part)
-                    if any(marker and marker in cmdline for marker in own_markers):
+                    if is_owned_main_openvpn(proc_root / str(pid)):
                         os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
@@ -2734,6 +2958,8 @@ def cleanup_stale_probe_processes(max_age_seconds: int = 90) -> int:
                 continue
             if int(age_text) < max_age_seconds or "openvpn" not in command or ".test_" not in command:
                 continue
+            if not is_owned_main_openvpn(Path("/proc") / pid_text):
+                continue
             try:
                 os.kill(int(pid_text), signal.SIGTERM)
                 cleaned += 1
@@ -2767,6 +2993,9 @@ def test_config_path(node_id: str) -> Path:
     return CONFIG_DIR / f".test_{safe_id}_{uuid.uuid4().hex}.ovpn"
 
 def test_node_by_id(node_id: str) -> dict[str, Any]:
+    allowed, reason = resource_guard.background_work_allowed()
+    if not allowed:
+        raise ValueError(reason)
     with lock:
         nodes = read_nodes()
         node = next((item for item in nodes if item.get("id") == node_id), None)
@@ -2838,10 +3067,16 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
             return {}
 
 def test_multiple_nodes(node_ids: list[str], progress_label: str = "", on_result=None) -> list[dict[str, Any]]:
+    allowed, reason = resource_guard.background_work_allowed()
+    if not allowed:
+        set_state(last_check_message=reason)
+        return [{"id": node_id, "_deferred": True, "probe_message": reason} for node_id in node_ids]
     cleanup_stale_probe_processes()
     with lock:
         nodes = read_nodes()
-        to_test = [n for n in nodes if n.get("id") in node_ids and not n.get("active")]
+        # Preserve original states so memory pressure never turns a healthy
+        # candidate into a failure or leaves an unstarted probe "testing".
+        to_test = [dict(n) for n in nodes if n.get("id") in node_ids and not n.get("active")]
         now = time.time()
         for n in nodes:
             if n.get("id") in node_ids and not n.get("active") and n.get("probe_status") != "unavailable":
@@ -2853,6 +3088,11 @@ def test_multiple_nodes(node_ids: list[str], progress_label: str = "", on_result
     def test_worker(args: tuple[int, dict[str, Any]]) -> dict[str, Any]:
         idx, n_info = args
         node_id = n_info["id"]
+        allowed, reason = resource_guard.background_work_allowed()
+        if not allowed:
+            return {"id": node_id, "_deferred": True,
+                    "probe_status": "pending" if n_info.get("probe_status") == "testing" else n_info.get("probe_status") or "pending",
+                    "probe_message": reason, "probed_at": n_info.get("probed_at", 0)}
         config_text = node_config_text(n_info)
         h = str(n_info.get("remote_host") or n_info.get("ip"))
         p = parse_int(n_info.get("remote_port"))
@@ -2911,7 +3151,7 @@ def test_multiple_nodes(node_ids: list[str], progress_label: str = "", on_result
         return temp_node
 
     updated_nodes_map = {}
-    max_workers = min(AVAILABILITY_TEST_WORKERS, max(1, len(to_test)))
+    max_workers = min(resource_guard.recommended_probe_workers(AVAILABILITY_TEST_WORKERS), max(1, len(to_test)))
     flush_step = max(4, max_workers * 4)
     progress_step = max(2, max_workers)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -2931,7 +3171,9 @@ def test_multiple_nodes(node_ids: list[str], progress_label: str = "", on_result
                     "latency_ms": 0,
                     "probed_at": time.time(),
                 }
-            if res.get("probe_status") == "available":
+            if res.get("_deferred"):
+                pass
+            elif res.get("probe_status") == "available":
                 available_so_far += 1
                 res["availability_failures"] = 0
                 res["next_probe_at"] = 0
@@ -2944,8 +3186,8 @@ def test_multiple_nodes(node_ids: list[str], progress_label: str = "", on_result
             updated_nodes_map[nid] = res
             completed_count += 1
             should_flush = (
-                (on_result is not None and res.get("probe_status") == "available")
-                or completed_count % flush_step == 0
+                (on_result is not None and res.get("probe_status") == "available" and not res.get("_deferred"))
+                or (completed_count % flush_step == 0 and not res.get("_deferred"))
                 or completed_count == len(to_test)
             )
             if should_flush:
@@ -2954,9 +3196,9 @@ def test_multiple_nodes(node_ids: list[str], progress_label: str = "", on_result
                     for current in current_nodes:
                         current_id = current.get("id")
                         if current_id in updated_nodes_map:
-                            current.update(updated_nodes_map[current_id])
+                            current.update({key: value for key, value in updated_nodes_map[current_id].items() if key != "_deferred"})
                     write_json(NODES_FILE, sort_all_nodes(current_nodes))
-            if on_result:
+            if on_result and not res.get("_deferred"):
                 try:
                     on_result(res)
                 except Exception as callback_exc:
@@ -2972,7 +3214,7 @@ def test_multiple_nodes(node_ids: list[str], progress_label: str = "", on_result
                 )
 
     # 批量查询并丰富可用节点的地理及 ISP 信息，防止并发时被定位 API 接口限流
-    successful_nodes = [res for res in updated_nodes_map.values() if res.get("probe_status") == "available"]
+    successful_nodes = [res for res in updated_nodes_map.values() if res.get("probe_status") == "available" and not res.get("_deferred")]
     if successful_nodes:
         try:
             vpn_utils.enrich_ip_info(successful_nodes)
@@ -2984,7 +3226,7 @@ def test_multiple_nodes(node_ids: list[str], progress_label: str = "", on_result
         for n in current_nodes:
             nid = n.get("id")
             if nid in updated_nodes_map:
-                n.update(updated_nodes_map[nid])
+                n.update({key: value for key, value in updated_nodes_map[nid].items() if key != "_deferred"})
         sorted_nodes = sort_all_nodes(current_nodes)
         write_json(NODES_FILE, sorted_nodes)
 
@@ -3401,6 +3643,10 @@ def refresh_node_catalog_only(force: bool = False) -> str:
     """Refresh addresses and metadata without running OpenVPN availability probes."""
     global is_connecting
     ensure_dirs()
+    allowed, reason = resource_guard.background_work_allowed()
+    if not allowed:
+        set_state(last_check_message=reason, last_fetch_status="deferred")
+        return reason
     if force:
         resume_metadata_refresh()
     elif metadata_refresh_paused() or metadata_cancel_event.is_set():
@@ -3420,10 +3666,10 @@ def refresh_node_catalog_only(force: bool = False) -> str:
         fetch_error = ""
         try:
             candidates = fetch_candidates(aggregate_all_sources=True)
-        except CatalogRefreshCancelled:
-            message = "节点资料拉取已停止；现有节点清单和国家出口保持不变。"
+        except CatalogRefreshCancelled as exc:
+            message = f"{exc}；现有节点清单和国家出口保持不变。"
             set_state(
-                metadata_refresh_paused=True,
+                metadata_refresh_paused=metadata_refresh_paused(),
                 refresh_cancel_requested=False,
                 last_check_message=message,
             )
@@ -3463,6 +3709,16 @@ def test_node_availability_only(
     """Probe availability for the exact node list selected by the UI."""
     global is_connecting
     ensure_dirs()
+    allowed, reason = resource_guard.background_work_allowed()
+    if not allowed:
+        results = read_json(STATE_FILE, {}).get("channel_test_results") or {}
+        if channel_id:
+            results[channel_id] = {"message": reason, "completed_at": time.time(), "deferred": True}
+        # Another worker may already hold the lock; do not erase its task.
+        set_state(last_check_message=reason,
+                  last_completed_channel_id=channel_id,
+                  last_completed_channel_message=reason if channel_id else "", channel_test_results=results)
+        return reason
     if not maintenance_lock.acquire(blocking=False):
         message = "节点任务正在运行，请稍后再试"
         if channel_id:
@@ -3541,8 +3797,11 @@ def test_node_availability_only(
             progress_label=task_label,
             on_result=release_on_first_available if channel_was_awaiting else None,
         )
-        available_count = sum(1 for n in tested_nodes if n.get("probe_status") == "available") + len(active_ids.intersection(requested_ids))
-        message = f"可用性检测完成：筛选结果 {len(requested_ids)} 个，实际测试 {len(test_ids)} 个，可用 {available_count} 个"
+        deferred = [n for n in tested_nodes if n.get("_deferred")]
+        available_count = sum(1 for n in tested_nodes if n.get("probe_status") == "available" and not n.get("_deferred")) + len(active_ids.intersection(requested_ids))
+        message = f"可用性检测完成：筛选结果 {len(requested_ids)} 个，实际测试 {len(test_ids) - len(deferred)} 个，可用 {available_count} 个"
+        if deferred:
+            message += f"；{len(deferred)} 个因资源保护暂缓，保留原状态。{deferred[0].get('probe_message', '')}"
         channel_test_results = read_json(STATE_FILE, {}).get("channel_test_results") or {}
         if channel_id:
             channel_test_results[channel_id] = {
@@ -3578,6 +3837,10 @@ def test_node_availability_only(
 def maintain_valid_nodes(force: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
     ensure_dirs()
+    allowed, reason = resource_guard.background_work_allowed()
+    if not allowed:
+        set_state(last_check_message=reason)
+        return reason
     if not maintenance_lock.acquire(blocking=False):
         msg = "节点维护任务正在运行，请稍后再试"
         set_state(last_check_message=msg)
@@ -5683,24 +5946,6 @@ function multiCountryOptions(selected){
 function multiProtocolLabel(value){return value==='hysteria'?'HY2':(value==='trojan'?'Trojan':'VLESS');}
 function multiIpTypeLabel(value){return ({residential:'住宅',mobile:'移动',hosting:'机房',unknown:'未知'})[value]||value||'未知';}
 function multiProbeLabel(value){return ({available:'可用',unavailable:'不可用',testing:'检测中',not_checked:'待检测'})[value]||'待检测';}
-function multiSpeedMbps(value){const speed=Number(value);return Number.isFinite(speed)&&speed>0?(speed*8/1000000).toFixed(2)+' Mbps':'-';}
-function multiSpeedTime(value){const stamp=Number(value);return stamp>0?new Date(stamp*1000).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}):'';}
-function multiSpeedCell(sample){
-  if(!sample)return '<small style="display:block;color:var(--text-secondary)">未测速</small>';
-  const stale=Date.now()/1000-Number(sample.tested_at||0)>10800;
-  const title=sample.ok?'小样本实际下载速率，含握手；不是峰值带宽':sample.error||'未完成实际下载';
-  return `<small title="${esc(title)}" style="display:block;color:${stale?'var(--text-secondary)':sample.ok?'var(--success)':'var(--warning)'}">${sample.ok?esc(multiSpeedMbps(sample.bps)):'测速失败'}${stale?' · 已过期':''}</small><small style="display:block;color:var(--text-secondary)">${esc(multiSpeedTime(sample.tested_at))}</small>`;
-}
-function multiSpeedSummary(channel){
-  const result=channel.speed_test||{};
-  const label=({testing:'正在测速',complete:'本轮完成',error:'测速暂未完成',waiting:'等待测速'})[result.status]||'等待首次测速';
-  const requested=Number(channel.speed_request_token||0)>Number(result.request_token||0);
-  const active=result.status==='testing'||result.status==='waiting';
-  const queued=requested;
-  const progress=active&&Number(result.total)>0?` · ${Number(result.tested||0)}/${Number(result.total)}`:'';
-  const winner=result.winner_bps&&result.status==='complete'&&!queued?` · 本轮优选 ${multiSpeedMbps(result.winner_bps)}`:'';
-  return `${queued?'已排队测速':label}${queued?'':progress}${winner}${result.message&&!queued?' · '+result.message:''}`;
-}
 function multiRowBackground(value){return value==='available'?'rgba(34,197,94,.16)':(value==='unavailable'?'rgba(239,68,68,.16)':'rgba(245,158,11,.17)');}
 function multiCandidateMatchesPolicy(node,policy){if(node.policy_rejection)return false;const t=node.ip_type||'unknown';if(policy==='residential_only')return t==='residential'||t==='mobile';if(policy==='hosting_only')return t==='hosting';return true;}
 function suggestedSocksPort(channel){
@@ -5727,28 +5972,21 @@ function renderMultiExit(){
   const runtime=(multiExitData.state&&multiExitData.state.channels)||{};
   const channels=multiExitData.config.channels||[];
   const connectedCount=channels.filter(c=>(runtime[c.id]||{}).status==='connected').length;
-  if($('channel_overview'))$('channel_overview').innerHTML=`<span>国家出口 <b>${channels.length}</b></span><span style="color:#34d399">已连接 <b>${connectedCount}</b></span><span style="color:#fbbf24">待连接 <b>${channels.length-connectedCount}</b></span><span>同国策略内测速择优 · 手动指定优先</span>`;
+  if($('channel_overview'))$('channel_overview').innerHTML=`<span>国家出口 <b>${channels.length}</b></span><span style="color:#34d399">已连接 <b>${connectedCount}</b></span><span style="color:#fbbf24">待连接 <b>${channels.length-connectedCount}</b></span><span>稳定连接优先 · 手动指定优先</span>`;
   box.innerHTML=(multiExitData.config.channels||[]).map((c,i)=>{
     const s=runtime[c.id]||{}; const status=s.status||(c.awaiting_initial_test?'testing':'connecting'); const ok=status==="connected"; const pending=['connecting','switching','testing'].includes(status); const candidates=c.candidates||[];
     const available=candidates.filter(n=>n.probe_status==='available'&&multiCandidateMatchesPolicy(n,c.ip_type)).length;
     const excluded=candidates.filter(n=>n.policy_rejection).length;
-    const speedSamples=(c.speed_test&&c.speed_test.samples)||{};
     const selectedNodeId=multiExitSelectedNodes[c.id]||c.preferred_node_id||s.node_id||'';
     const rows=candidates.map(n=>{const current=n.id===s.node_id;const preferred=n.id===c.preferred_node_id;const checked=n.id===selectedNodeId;const rejection=n.policy_rejection||'';return `<label title="${esc(rejection||n.probe_message||'')}" style="display:grid;grid-template-columns:28px 1.2fr .8fr 1.2fr .7fr .7fr;gap:8px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--border-color);border-left:4px solid ${rejection?'#94a3b8':n.probe_status==='available'?'#22c55e':(n.probe_status==='unavailable'?'#ef4444':'#f59e0b')};font-size:12px;background:${rejection?'rgba(148,163,184,.10)':multiRowBackground(n.probe_status)};${current?'font-weight:700;outline:1px solid rgba(59,130,246,.55);outline-offset:-1px;':''}">
       <input type="radio" name="candidate-${esc(c.id)}" value="${esc(n.id)}" ${checked?'checked':''} ${rejection?'disabled':''} onchange="rememberMultiExitCandidate('${esc(c.id)}','${esc(n.id)}')">
-      <span>${esc(n.ip||n.entry_ip||'-')}${current?' <b style="color:var(--success)">当前</b>':''}</span><span>${esc(multiIpTypeLabel(n.ip_type))}</span><span title="${esc(n.owner||'')}">${esc(n.owner||'-')}</span><span>${rejection?'策略排除':esc(multiProbeLabel(n.probe_status))}</span><span>${n.latency_ms?esc(n.latency_ms+' ms'):'-'}${multiSpeedCell(speedSamples[n.id])}</span>${rejection?'<span style="grid-column:2/-1;color:var(--text-secondary)">'+esc(rejection)+'</span>':''}</label>`;}).join('');
+      <span>${esc(n.ip||n.entry_ip||'-')}${current?' <b style="color:var(--success)">当前</b>':''}</span><span>${esc(multiIpTypeLabel(n.ip_type))}</span><span title="${esc(n.owner||'')}">${esc(n.owner||'-')}</span><span>${rejection?'策略排除':esc(multiProbeLabel(n.probe_status))}</span><span>${n.latency_ms?esc(n.latency_ms+' ms'):'-'}</span>${rejection?'<span style="grid-column:2/-1;color:var(--text-secondary)">'+esc(rejection)+'</span>':''}</label>`;}).join('');
     const stateLabel=ok?'已连接':(c.awaiting_initial_test?'等待 / 首次检测':status==='testing'?'正在检测':pending?'正在连接':'断线恢复中');
     return `<section class="country-card" data-health="${ok?'connected':pending?'pending':'failed'}" data-channel-card="${esc(c.id)}">
       <div style="display:flex;justify-content:space-between;gap:12px;align-items:center"><div><strong style="font-size:20px">${esc(c.country||c.name||c.id)}</strong><span style="font-size:12px;color:var(--text-secondary);margin-left:12px">${esc(multiProtocolLabel(c.protocol))} · ${esc(c.inbound_port)}</span></div><span class="badge ${ok?'available':(pending?'testing':'unavailable')}">${stateLabel}</span></div>
       <div class="channel-facts"><div><small>中转入口 · VPNGate 节点</small><strong>${esc(s.entry_ip||'尚未选定')}</strong>${esc(s.entry_provider||'选定节点后显示服务商')}</div><div><small>实际公网出口</small><strong>${esc(s.exit_ip||'尚未连接')}</strong>${esc(s.exit_provider||'连接验证后显示服务商')} · ${esc(multiIpTypeLabel(s.exit_ip_type))}</div></div>
-      <div class="channel-state-note">${esc(c.awaiting_initial_test?'系统自动排队检测本国候选，找到首个合格节点后立即连接。':s.error||(ok?(c.preferred_node_id?'出口正常，手动指定 IP 优先；自动测速切换已暂缓。':c.speed_auto!==false?'出口正常，后台分批测速；同策略出口明显更快时自动切换。':'出口正常，保持当前 IP；备用节点由后台维护。'):'系统正在选择并验证本国出口。'))}</div>
+      <div class="channel-state-note">${esc(c.awaiting_initial_test?'系统自动排队检测本国候选，找到首个合格节点后立即连接。':s.error||(ok?(c.preferred_node_id?'出口正常，保持手动指定 IP；异常时尝试同国合格备用。':'出口正常，保持当前 IP；仅在异常时尝试同国合格备用。'):'系统正在选择并验证本国出口。'))}</div>
       <div class="channel-fields"><label>出口国家<select data-field="country" class="input-field">${multiCountryOptions(c.country)}</select></label><label>入站端口<input data-field="inbound_port" type="number" min="1024" max="65535" class="input-field" value="${c.inbound_port}"></label><label>连接协议<select data-field="protocol" class="input-field"><option value="vless" ${c.protocol==='vless'?'selected':''}>VLESS</option><option value="trojan" ${c.protocol==='trojan'?'selected':''}>Trojan</option><option value="hysteria" ${(c.protocol||'hysteria')==='hysteria'?'selected':''}>HY2</option></select></label><label>IP 选择策略<select data-field="ip_type" class="input-field"><option value="all" ${c.ip_type==='all'?'selected':''}>全部 IP</option><option value="residential_preferred" ${c.ip_type==='residential_preferred'?'selected':''}>住宅优先</option><option value="residential_only" ${c.ip_type==='residential_only'?'selected':''}>仅住宅</option><option value="hosting_only" ${c.ip_type==='hosting_only'?'selected':''}>仅机房</option></select></label></div>
-      <div style="margin-top:14px;padding:12px 14px;border:1px solid rgba(139,92,246,.35);border-radius:10px;background:rgba(139,92,246,.06)">
-        <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><label style="display:flex;gap:8px;align-items:center;font-weight:700"><input data-field="speed_auto" type="checkbox" ${c.speed_auto!==false?'checked':''} onchange="channelMessage('${esc(c.id)}','请点击保存并应用本线路，保存自动测速设置；手动指定 IP 优先。')"> 自动测速择优</label><button class="toolbar-btn" onclick="speedMultiExitChannel('${esc(c.id)}')">测速并自动择优</button></div>
-        <div style="font-size:12px;margin-top:8px">${esc(multiSpeedSummary(c))}</div>
-        <div style="font-size:11px;color:var(--text-secondary);margin-top:6px">每 15 分钟分批轮测，单轮最多 6 个；以两次 1 MiB 实际下载的较慢值比较，并非峰值带宽。同类型自动切换需提速超过 25%，间隔至少 30 分钟；保持国家、IP 类型和服务商排除规则。${c.preferred_node_id?' 当前已手动指定 IP；点击“测速并自动择优”会解除手动固定。':''}</div>
-        ${s.speed_switch_reason?`<div style="font-size:11px;color:var(--text-secondary);margin-top:5px">上次择优：${esc(s.speed_switch_reason)} · ${esc(multiSpeedTime(s.speed_switch_at))}</div>`:''}
-      </div>
       <div style="margin-top:14px;padding:14px;border:1px solid ${c.socks_enabled?'rgba(34,197,94,.55)':'var(--border-color)'};border-radius:10px;background:${c.socks_enabled?'rgba(34,197,94,.07)':'rgba(148,163,184,.04)'}">
         <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap"><label style="display:flex;gap:8px;align-items:center;font-weight:700"><input data-field="socks_enabled" type="checkbox" ${c.socks_enabled?'checked':''} onchange="toggleChannelSocksFields('${esc(c.id)}')"> 启用指纹浏览器 SOCKS5</label><span style="font-size:12px;color:var(--text-secondary)">强制账号密码验证 · 固定跟随本线路出口</span></div>
         <div data-socks-fields class="channel-fields" style="margin-top:12px">
@@ -5832,15 +6070,6 @@ function toggleChannelSocksFields(id){const card=channelCard(id);if(!card)return
 async function testMultiExitChannel(id){
   const startedAt=Date.now()/1000;channelMessage(id,'正在启动本国节点检测...');try{const r=await fetch('./api/test_multi_exit_channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel_id:id})});const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'启动失败');channelMessage(id,d.message);monitorChannelAvailability(id,startedAt);}catch(e){channelMessage(id,e.message);}
 }
-async function speedMultiExitChannel(id){
-  channelMessage(id,'正在排队测速；现有连接保持运行...');
-  try{
-    const r=await fetch('./api/speed_multi_exit_channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel_id:id})});
-    const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'启动测速失败');
-    delete multiExitSelectedNodes[id];
-    await loadMultiExit();channelMessage(id,d.message);
-  }catch(e){channelMessage(id,e.message);}
-}
 async function monitorChannelAvailability(id,startedAt){
   let seen=false;
   for(let i=0;i<600;i++){
@@ -5916,7 +6145,6 @@ async function saveMultiExitChannel(id){
     inbound_port:parseInt(card.querySelector('[data-field=inbound_port]').value),
     protocol:card.querySelector('[data-field=protocol]').value,
     ip_type:card.querySelector('[data-field=ip_type]').value,
-    speed_auto:card.querySelector('[data-field=speed_auto]').checked,
     socks_enabled:socksEnabled,
     socks_port:socksPort,
     socks_username:card.querySelector('[data-field=socks_username]').value.trim(),
@@ -6822,7 +7050,7 @@ function handleRoutingModeChange(mode) {
     warningDiv.style.color = "var(--warning)";
     warningDiv.style.background = "rgba(245, 158, 11, 0.1)";
     warningDiv.style.border = "1px solid rgba(245, 158, 11, 0.2)";
-    warningDiv.innerHTML = `⚠️ <strong>固定地区</strong>：限制仅连接选定国家的节点，且后台仅并发测速该国家的节点。如果该国的所有可用节点都失效，会造成代理中断且<strong>绝不自动切换到其他国家</strong>的节点。`;
+    warningDiv.innerHTML = `⚠️ <strong>固定地区</strong>：限制仅连接选定国家的节点，可用性检测受内存保护和并发限制。如果该国的所有可用节点都失效，会造成代理中断且<strong>绝不自动切换到其他国家</strong>的节点。`;
   } else if (mode === "favorites") {
     countryGroup.style.display = "none";
     warningDiv.style.color = "var(--warning)";
@@ -7696,7 +7924,7 @@ class Handler(BaseHTTPRequestHandler):
             active_node = next((n for n in nodes if active_openvpn_node_id and n.get("id") == active_openvpn_node_id), None)
             for n in nodes:
                 n["active"] = (active_openvpn_node_id and n.get("id") == active_openvpn_node_id)
-            if active_node:
+            if active_node and not BACKGROUND_PAUSED:
                 ip = active_node.get("ip") or active_node.get("remote_host")
                 if ip:
                     now = time.time()
@@ -7735,8 +7963,14 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
         elif effective_path == "/api/multi_exit":
-            self.send_json(multi_exit_payload())
+            self.send_json(multi_exit_payload(read_only=BACKGROUND_PAUSED))
         elif effective_path == "/api/gateway_status":
+            if BACKGROUND_PAUSED:
+                self.send_json({"ok": True, "background_paused": True, "services": [{
+                    "name": "后台维护", "status": "paused", "details": BACKGROUND_PAUSED_MESSAGE,
+                    "error": "",
+                }]})
+                return
             web_ui_status = {
                 "name": "Web 管理服务",
                 "status": "running",
@@ -7806,7 +8040,7 @@ class Handler(BaseHTTPRequestHandler):
                 "name": "节点同步守护线程",
                 "status": "running" if collector_ok else "stopped",
                 "details": f"上次心跳: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_collector_heartbeat)) if last_collector_heartbeat > 0 else '等待启动'}",
-                "error": "" if collector_ok else "线程可能已异常终止，导致无法在后台拉取和测速新节点。"
+                "error": "" if collector_ok else "线程可能已异常终止，导致无法在后台更新节点资料。"
             }
             checker_ok = (last_checker_heartbeat > 0.0 and now - last_checker_heartbeat < 90.0) or (server_uptime < 35.0)
             checker_status = {
@@ -7817,7 +8051,7 @@ class Handler(BaseHTTPRequestHandler):
             }
             pinger_ok = (last_pinger_heartbeat > 0.0 and now - last_pinger_heartbeat < 30.0) or (server_uptime < 15.0)
             pinger_status = {
-                "name": "延迟测速守护线程",
+                "name": "连接延迟检查线程",
                 "status": "running" if pinger_ok else "stopped",
                 "details": f"上次心跳: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_pinger_heartbeat)) if last_pinger_heartbeat > 0 else '等待启动'}",
                 "error": "" if pinger_ok else "线程可能已中止，无法实时刷新活动节点的 Ping 延迟。"
@@ -7920,6 +8154,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if not self.is_authorized():
             self.send_json({"error": "Unauthorized"}, HTTPStatus.UNAUTHORIZED)
+            return
+
+        if BACKGROUND_PAUSED:
+            self.send_json({"ok": False, "background_paused": True,
+                            "error": BACKGROUND_PAUSED_MESSAGE}, HTTPStatus.SERVICE_UNAVAILABLE)
             return
 
         if effective_path == "/api/update_direct_protocol":
@@ -8035,7 +8274,6 @@ class Handler(BaseHTTPRequestHandler):
                     "id": channel_id, "name": channel_name,
                     "country": country, "inbound_port": port, "protocol": protocol,
                     "ip_type": ip_type, "enabled": True,
-                    "speed_auto": payload.get("speed_auto", updated.get("speed_auto", True)) is not False,
                     "socks_enabled": socks_enabled, "socks_port": socks_port,
                     "socks_username": socks_username, "socks_password": socks_password,
                 })
@@ -8189,15 +8427,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
 
-        if effective_path == "/api/speed_multi_exit_channel":
-            try:
-                payload = self.read_json_body()
-                channel_id = str(payload.get("channel_id") or "").strip()
-                self.send_json(request_channel_speed_test(channel_id))
-            except Exception as exc:
-                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
-            return
-
         if effective_path == "/api/test_multi_exit_channel":
             try:
                 payload = self.read_json_body()
@@ -8280,7 +8509,6 @@ class Handler(BaseHTTPRequestHandler):
                         "id": cid, "name": str(item.get("name") or previous.get("name") or country + "线路")[:30],
                         "inbound_port": port, "country": country, "protocol": protocol,
                         "ip_type": ip_type, "enabled": bool(item.get("enabled", True)),
-                        "speed_auto": item.get("speed_auto", previous.get("speed_auto", True)) is not False,
                         "socks_enabled": socks_enabled, "socks_port": socks_port,
                         "socks_username": socks_username, "socks_password": socks_password,
                     })
@@ -8701,8 +8929,25 @@ class Tee:
     def __getattr__(self, attr: str) -> Any:
         return getattr(self.stdout, attr)
 
+def serve_paused_admin() -> None:
+    """Restore the control plane without touching live tunnels or provisioning."""
+    metadata_cancel_event.set()
+    set_state(background_paused=True, metadata_refresh_paused=True,
+              maintenance_task="", maintenance_channel_id="", is_connecting=False,
+              last_fetch_status="paused", last_check_message=BACKGROUND_PAUSED_MESSAGE)
+    threading.Thread(target=start_bundle_server, daemon=True).start()
+    ui_cfg = load_ui_config()
+    ui_host = ui_cfg.get("host", UI_HOST)
+    ui_port = bounded_int(ui_cfg.get("port"), UI_PORT, 1, 65535)
+    print(BACKGROUND_PAUSED_MESSAGE, flush=True)
+    DualStackHTTPServer((ui_host, ui_port), Handler).serve_forever()
+
+
 def main() -> None:
     ensure_dirs()
+    if BACKGROUND_PAUSED:
+        serve_paused_admin()
+        return
     if metadata_refresh_paused():
         metadata_cancel_event.set()
     compacted_configs = compact_node_catalog_configs()

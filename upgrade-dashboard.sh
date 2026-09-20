@@ -5,7 +5,7 @@ umask 077
 app=/opt/aimilivpn
 [[ -f "$app/vpngate_manager.py" ]] || { echo '未检测到已安装后台'; exit 1; }
 work=$(mktemp -d /tmp/gateway-dashboard.XXXXXX)
-backup="/var/backups/aimilivpn/dashboard-43-$(date +%Y%m%d-%H%M%S)-$$"
+backup="/var/backups/aimilivpn/dashboard-44-$(date +%Y%m%d-%H%M%S)-$$"
 cleanup() {
   [[ "$work" == /tmp/gateway-dashboard.* && -d "$work" ]] && rm -rf -- "$work"
 }
@@ -20,7 +20,7 @@ if [[ -z "$ref" ]]; then
 fi
 [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || { echo '无法确定升级版本，请稍后重试'; exit 1; }
 base="https://raw.githubusercontent.com/GaryTung/newinstall/$ref"
-sources=(vpngate_manager.py xui_multi_provision.py multi_exit_manager.py channel_network.py channel_policy.py migrate_network_slots.py exit_speed.py proxy_server.py)
+sources=(vpngate_manager.py xui_multi_provision.py multi_exit_manager.py channel_network.py channel_policy.py migrate_network_slots.py resource_guard.py proxy_server.py)
 for file in "${sources[@]}" VERSION; do
   curl -fsSL --retry 2 --connect-timeout 15 "$base/$file" -o "$work/$file"
 done
@@ -30,7 +30,7 @@ done
 
 targets=(
   "$app/vpngate_manager.py" "$app/channel_network.py" "$app/channel_policy.py"
-  "$app/migrate_network_slots.py" "$app/VERSION"
+  "$app/migrate_network_slots.py" "$app/resource_guard.py" "$app/VERSION"
   "$app/exit_speed.py" "$app/proxy_server.py" /var/lib/aimilivpn-multiexit/speed_results.json
   /usr/local/sbin/xui-multi-provision /usr/local/sbin/aimilivpn-multiexit
   /var/lib/aimilivpn-multiexit/channels.json /var/lib/aimilivpn-multiexit/state.json
@@ -85,7 +85,7 @@ done
 restore_ready=1
 install -m 0644 "$work/channel_network.py" "$app/channel_network.py"
 install -m 0644 "$work/channel_policy.py" "$app/channel_policy.py"
-install -m 0644 "$work/exit_speed.py" "$app/exit_speed.py"
+install -m 0644 "$work/resource_guard.py" "$app/resource_guard.py"
 install -m 0755 "$work/proxy_server.py" "$app/proxy_server.py"
 install -m 0755 "$work/migrate_network_slots.py" "$app/migrate_network_slots.py"
 install -m 0755 "$work/vpngate_manager.py" "$app/vpngate_manager.py"
@@ -101,4 +101,5 @@ systemctl is-active --quiet x-ui
 systemctl is-active --quiet aimilivpn-multiexit
 systemctl is-active --quiet aimilivpn
 trap - ERR INT TERM
-printf '后台升级完成，出口测速择优与 DNS 缓存已启用；线路将自动恢复，测速在恢复后后台执行。备份：%s\n' "$backup"
+printf '后台升级完成：已移除下载测速与测速择优，保留有界 DNS 缓存；线路将自动恢复。备份：%s\n' "$backup"
+printf '%s\n' '既有 systemd 应急暂停配置保持不变；若之前暂停了后台任务，升级不会解除该暂停。'

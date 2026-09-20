@@ -21,7 +21,6 @@ APP_DIR = Path(os.environ.get("VPNGATE_APP_DIR", "/opt/aimilivpn"))
 sys.path.insert(0, str(APP_DIR if (APP_DIR / "channel_network.py").exists() else Path(__file__).resolve().parent))
 from channel_network import channel_network, channel_slot, ensure_network_slots, managed_address
 from channel_policy import provider_rejection as channel_provider_rejection, failure_record, ip_type_rank as shared_ip_type_rank, effective_ip_type
-import exit_speed
 SOURCE_DATA = Path(os.environ.get("VPNGATE_DATA_DIR", "/var/lib/aimilivpn"))
 try:
     if not (SOURCE_DATA / "nodes.json").exists() and Path("/opt/aimilivpn/vpngate_data/nodes.json").exists():
@@ -405,7 +404,6 @@ def select_candidates(channel, exclude=None, history=None, recovery=False):
     preferred = str(channel.get("preferred_node_id") or "")
     deep_failures = deep_failure_records()
     verified_exits = verified_exit_records()
-    speed_result = exit_speed.read_results(DATA_DIR).get("channels", {}).get(channel.get("id"), {})
     for node in nodes if isinstance(nodes, list) else []:
         nid = str(node.get("id") or "")
         if not nid or nid in exclude or not country_matches(node, channel["country"]):
@@ -424,10 +422,6 @@ def select_candidates(channel, exclude=None, history=None, recovery=False):
             if not recovery or now - last_failure < RECOVERY_COOLDOWN_RETRY_SECONDS:
                 continue
         rank = ip_type_rank(node, channel.get("ip_type", "all"))
-        speed_sample = speed_result.get("samples", {}).get(nid, {})
-        if exit_speed.valid_sample(speed_sample, node, channel, now):
-            rank = ip_type_rank({**node, "exit_ip": speed_sample.get("exit_ip"),
-                                 "exit_ip_type": speed_sample.get("ip_type")}, channel.get("ip_type", "all"))
         if rank >= 99:
             continue
         status = str(node.get("probe_status") or "pending")
@@ -441,7 +435,6 @@ def select_candidates(channel, exclude=None, history=None, recovery=False):
         selected.append((
             0 if nid == preferred else 1,
             rank,
-            *exit_speed.speed_order(channel, node, speed_result, now),
             verified_rank,
             status_rank,
             -int(node_history.get("successful_connections") or 0),
@@ -609,10 +602,6 @@ def connect_channel(channel, index, previous, history):
         # Do not leave an offline country waiting hours for historical backoff.
         # Live retries remain rate-limited by last_failure_at.
         candidates = select_candidates(channel, history=history, recovery=True)
-    fallback_id = channel.get("_speed_fallback_node_id")
-    if fallback_id:
-        preferred = channel.get("preferred_node_id")
-        candidates.sort(key=lambda node: 0 if node.get("id") == preferred else 1 if node.get("id") == fallback_id else 2)
     if not candidates:
         pool = [n for n in read_json(NODES_FILE, []) if country_matches(n, channel['country'])]
         policy = [n for n in pool if not channel_provider_rejection(channel, node=n) and ip_type_rank(n, channel.get('ip_type', 'all')) < 99]
@@ -692,8 +681,6 @@ def daemon():
     legacy_history = state.setdefault("node_history", {})
     channel_histories = state.setdefault("channel_node_history", {})
     first_pass = True
-    threading.Thread(target=exit_speed.speed_loop, args=(sys.modules[__name__],), daemon=True,
-                     name="exit-speed-worker").start()
     while True:
         cfg = load_config()
         desired = {c["id"]: c for c in cfg["channels"] if c.get("enabled")}
@@ -835,18 +822,6 @@ def daemon():
                             "status": "connected",
                             "error": f"健康检测暂时失败 {failures}/{HEALTH_FAILURE_THRESHOLD}：{detail}",
                         })
-            speed_target = ""
-            if healthy and runtime.get("status") == "connected":
-                speed_result = exit_speed.read_results(DATA_DIR).get("channels", {}).get(channel["id"], {})
-                speed_target = exit_speed.choose_switch(
-                    channel, runtime, select_candidates(channel, history=history), speed_result,
-                ) if speed_result.get("status") == "complete" else ""
-                if speed_target:
-                    record_runtime_end(history, runtime, failed=False)
-                    healthy = False
-                    runtime.update({"speed_switch_at": time.time(),
-                                    "speed_request_applied": float(channel.get("speed_request_token") or 0),
-                                    "speed_switch_reason": "已验证同国家更快出口，正在切换", "status": "switching"})
             if not healthy:
                 previous = dict(runtime)
                 if not processes_alive and previous.get("node_id"):
@@ -864,16 +839,7 @@ def daemon():
                 runtime.update({"status": "connecting", "error": "", "exit_ip": "", "exit_country_code": "", "node_id": "", "openvpn_pid": 0, "proxy_pid": 0, "checked_at": time.time()})
                 write_json(STATE_FILE, state)
                 try:
-                    target_channel = {**channel, "preferred_node_id": speed_target,
-                                      "_speed_fallback_node_id": previous.get("node_id")} if speed_target else channel
-                    state["channels"][channel["id"]] = connect_channel(target_channel, index, previous, history)
-                    for key in ("speed_switch_at", "speed_request_applied", "speed_switch_reason"):
-                        if key in previous:
-                            state["channels"][channel["id"]][key] = previous[key]
-                    if speed_target:
-                        chosen = state["channels"][channel["id"]]
-                        chosen["speed_switch_reason"] = ("已连接实测优选出口" if chosen.get("node_id") == speed_target
-                                                          else "优选节点连接失败，已恢复其他合格出口")
+                    state["channels"][channel["id"]] = connect_channel(channel, index, previous, history)
                     state["channels"][channel["id"]]["config_signature"] = signature
                     state["channels"][channel["id"]]["consecutive_health_failures"] = 0
                 except Exception as exc:

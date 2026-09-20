@@ -649,7 +649,8 @@ def start_proxy_server(host: str, port: int) -> None:
                     pass
                 continue
 
-            def run_client() -> None:
+            # Bind this socket before the accept loop advances to the next peer.
+            def run_client(client=client, address=address) -> None:
                 try:
                     proxy_client(client, address)
                 finally:
