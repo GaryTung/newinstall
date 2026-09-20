@@ -1,5 +1,7 @@
 import ast
 import importlib.util
+import json
+import sqlite3
 import threading
 import time
 import unittest
@@ -23,7 +25,7 @@ class BootstrapTests(unittest.TestCase):
         source = (Path(__file__).resolve().parents[1] / 'vpngate_manager.py').read_text(encoding='utf-8')
         self.assertNotIn('configured.has(country)', source)
         self.assertNotIn('已经存在相同协议的线路，请选择另一协议', source)
-        self.assertIn('该端口已被其他国家线路使用', source)
+        self.assertIn('已被其他线路使用', source)
 
     def test_manual_ip_selection_is_saved_and_wakes_only_changed_channel(self):
         manager = (Path(__file__).resolve().parents[1] / 'vpngate_manager.py').read_text(encoding='utf-8')
@@ -42,6 +44,37 @@ class BootstrapTests(unittest.TestCase):
             'vless', 24129, '/cert.pem', '/key.pem', '161.33.194.236', '236.服务器直连'
         )
         self.assertEqual(inbound['remark'], '236.服务器直连')
+
+    def test_fingerprint_browser_socks_is_authenticated_and_country_routed(self):
+        root = Path(__file__).resolve().parents[1]
+        manager = (root / 'vpngate_manager.py').read_text(encoding='utf-8')
+        provision_source = (root / 'xui_multi_provision.py').read_text(encoding='utf-8')
+        for marker in (
+            '启用指纹浏览器 SOCKS5', 'copyChannelSocks',
+            'socks_username', 'socks_password', 'SOCKS5本身不加密',
+        ):
+            self.assertIn(marker, manager)
+        self.assertIn('"auth": "password"', provision_source)
+        self.assertNotIn('"auth": "noauth"', provision_source)
+        self.assertIn('socks-country-', provision_source)
+
+        source = root / 'xui_multi_provision.py'
+        spec = importlib.util.spec_from_file_location('xui_multi_socks_route_test', source)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        db = sqlite3.connect(':memory:')
+        db.execute('create table settings(id integer primary key, key text unique, value text)')
+        module.update_xray_template(db, [{
+            'outbound_tag': 'VPNGATE-COUNTRY-JP', 'proxy_address': '10.240.1.2',
+            'inbound_tag': 'country-jp', 'inbound_tags': ['country-jp', 'socks-country-jp'],
+        }], 'direct-test', 'direct-test')
+        config = json.loads(db.execute(
+            "select value from settings where key='xrayTemplateConfig'"
+        ).fetchone()[0])
+        rule = next(item for item in config['routing']['rules'] if item.get('outboundTag') == 'VPNGATE-COUNTRY-JP')
+        self.assertEqual(rule['inboundTag'], ['country-jp', 'socks-country-jp'])
+        db.close()
+
     def test_late_channel_discovered_and_no_duplicate_workers(self):
         source = Path(__file__).resolve().parents[1] / 'vpngate_manager.py'
         tree = ast.parse(source.read_text(encoding='utf-8'))

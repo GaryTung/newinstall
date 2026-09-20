@@ -163,7 +163,9 @@ def update_xray_template(db, routes, direct_tag, old_direct_tag, partial=False, 
         outbounds[:] = [x for x in outbounds if str(x.get("tag", "")) not in route_tags]
     elif not direct_only:
         outbounds[:] = [x for x in outbounds if not str(x.get("tag", "")).startswith(prefixes)]
-    route_inbound_tags = {route["inbound_tag"] for route in routes}
+    route_inbound_tags = {
+        tag for route in routes for tag in (route.get("inbound_tags") or [route["inbound_tag"]])
+    }
     if direct_only:
         rules[:] = [x for x in rules if direct_tag not in (x.get("inboundTag") or []) and old_direct_tag not in (x.get("inboundTag") or [])]
         rules.append({"type": "field", "inboundTag": [direct_tag], "outboundTag": "direct", "enabled": True})
@@ -186,7 +188,7 @@ def update_xray_template(db, routes, direct_tag, old_direct_tag, partial=False, 
             "settings": {"servers": [{"address": route["proxy_address"], "port": 1080, "users": []}]},
         })
         rules.append({
-            "type": "field", "inboundTag": [route["inbound_tag"]],
+            "type": "field", "inboundTag": route.get("inbound_tags") or [route["inbound_tag"]],
             "outboundTag": route["outbound_tag"], "enabled": True,
         })
     row = db.execute("select id from settings where key='xrayTemplateConfig'").fetchone()
@@ -209,11 +211,16 @@ def delete_channel(database: Path, result_path: Path, channel_id: str):
     db.row_factory = sqlite3.Row
     try:
         remark = "COUNTRY:" + cid
+        socks_remark = "SOCKS:" + cid
         inbound = db.execute("select * from inbounds where remark=?", (remark,)).fetchone()
         inbound_tag = str(inbound["tag"] if inbound else previous_item.get("inbound_tag") or "")
         if inbound:
             remove_normalized_client(db, inbound["id"])
             db.execute("delete from inbounds where id=?", (inbound["id"],))
+        socks_inbound = db.execute("select id from inbounds where remark=?", (socks_remark,)).fetchone()
+        if socks_inbound:
+            remove_normalized_client(db, socks_inbound["id"])
+            db.execute("delete from inbounds where id=?", (socks_inbound["id"],))
         row = db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()
         if row:
             template = json.loads(row[0])
@@ -300,7 +307,12 @@ def main():
             insert_normalized_client(db, source["id"], direct_client)
             if not args.direct_only:
                 desired_remarks = {"COUNTRY:" + str(c["id"]).lower() for c in channels}
-                stale = db.execute("select id,remark from inbounds where remark like 'COUNTRY:%'").fetchall()
+                desired_remarks.update(
+                    "SOCKS:" + str(c["id"]).lower() for c in channels if c.get("socks_enabled")
+                )
+                stale = db.execute(
+                    "select id,remark from inbounds where remark like 'COUNTRY:%' or remark like 'SOCKS:%'"
+                ).fetchall()
                 for row in stale:
                     if row["remark"] not in desired_remarks:
                         remove_normalized_client(db, row["id"])
@@ -313,9 +325,14 @@ def main():
             if args.channel_id and cid != args.channel_id.lower():
                 continue
             remark = "COUNTRY:" + cid
+            socks_remark = "SOCKS:" + cid
             port = int(channel["inbound_port"])
-            conflict = db.execute("select id,remark from inbounds where port=? and remark<>?", (port, remark)).fetchone()
             existing = db.execute("select * from inbounds where remark=?", (remark,)).fetchone()
+            existing_socks = db.execute("select * from inbounds where remark=?", (socks_remark,)).fetchone()
+            conflict = db.execute(
+                "select id,remark from inbounds where port=? and remark not in (?,?)",
+                (port, remark, socks_remark),
+            ).fetchone()
             if conflict:
                 raise RuntimeError(f"端口 {port} 已被入站 {conflict['remark']} 使用")
             old_client = None
@@ -326,6 +343,9 @@ def main():
                 old_client = (old_settings.get("clients") or [None])[0]
                 remove_normalized_client(db, existing["id"])
                 db.execute("delete from inbounds where id=?", (existing["id"],))
+            if existing_socks:
+                remove_normalized_client(db, existing_socks["id"])
+                db.execute("delete from inbounds where id=?", (existing_socks["id"],))
             protocol = str(channel.get("protocol") or old_protocol or old_direct_protocol)
             if protocol not in ("vless", "trojan", "hysteria"):
                 raise RuntimeError(f"线路 {cid} 的协议无效")
@@ -346,11 +366,50 @@ def main():
                 [item[name] for name in names],
             )
             insert_normalized_client(db, cursor.lastrowid, client)
+            inbound_tags = [item["tag"]]
+            socks_tag = ""
+            if channel.get("socks_enabled"):
+                socks_port = int(channel.get("socks_port") or 0)
+                socks_username = str(channel.get("socks_username") or "")
+                socks_password = str(channel.get("socks_password") or "")
+                if not 1024 <= socks_port <= 65535 or socks_port == port:
+                    raise RuntimeError(f"线路 {cid} 的 SOCKS5 端口无效或与节点端口重复")
+                if not socks_username or not socks_password:
+                    raise RuntimeError(f"线路 {cid} 的 SOCKS5 账号或密码为空")
+                socks_conflict = db.execute(
+                    "select id,remark from inbounds where port=? and remark<>?", (socks_port, socks_remark)
+                ).fetchone()
+                if socks_conflict:
+                    raise RuntimeError(f"SOCKS5 端口 {socks_port} 已被入站 {socks_conflict['remark']} 使用")
+                socks_tag = f"socks-country-{cid}"
+                socks_item = dict(source)
+                socks_item.pop("id", None)
+                socks_item.update({
+                    "remark": socks_remark, "port": socks_port, "enable": 1,
+                    "tag": socks_tag, "protocol": "socks",
+                    "settings": compact({
+                        "auth": "password",
+                        "accounts": [{"user": socks_username, "pass": socks_password}],
+                        "udp": False, "ip": "127.0.0.1", "userLevel": 0,
+                    }),
+                    "stream_settings": compact({"network": "tcp", "security": "none"}),
+                    "sniffing": compact({"enabled": True, "destOverride": ["http", "tls"]}),
+                    "up": 0, "down": 0, "last_traffic_reset_time": 0,
+                    "share_addr_strategy": "custom", "share_addr": "",
+                })
+                socks_names = [name for name in socks_item if name in columns]
+                db.execute(
+                    f"insert into inbounds({','.join(socks_names)}) values({','.join('?' for _ in socks_names)})",
+                    [socks_item[name] for name in socks_names],
+                )
+                inbound_tags.append(socks_tag)
             results.append({
                 "id": cid, "name": channel.get("name", cid), "country": channel["country"],
                 "port": port, "protocol": protocol, "subId": client.get("subId"),
                 "inbound_tag": item["tag"], "outbound_tag": "VPNGATE-COUNTRY-" + cid.upper(),
-                "proxy_address": channel_ip(index),
+                "proxy_address": channel_ip(index), "inbound_tags": inbound_tags,
+                "socks_enabled": bool(channel.get("socks_enabled")),
+                "socks_port": int(channel.get("socks_port") or 0), "socks_tag": socks_tag,
             })
         if args.channel_id and not results:
             raise RuntimeError(f"未找到线路 {args.channel_id}")

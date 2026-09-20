@@ -743,6 +743,13 @@ def multi_exit_payload() -> dict[str, Any]:
         state["exit_provider"] = str(state.get("exit_provider") or "") or providers.get(str(state.get("exit_ip") or ""), "") or state["entry_provider"]
         info = subscriptions.get(cid, {})
         channel["sub_id"] = str(info.get("subId") or "")
+        channel["socks_host"] = host
+        if channel.get("socks_enabled") and host:
+            socks_user = urllib.parse.quote(str(channel.get("socks_username") or ""), safe="")
+            socks_password = urllib.parse.quote(str(channel.get("socks_password") or ""), safe="")
+            channel["socks_proxy_url"] = (
+                f"socks5://{socks_user}:{socks_password}@{host}:{int(channel.get('socks_port') or 0)}"
+            )
         if host and channel["sub_id"]:
             try:
                 channel["universal_node"] = xui_node_content(channel["sub_id"], "universal", host, channel.get("name", ""))
@@ -5644,6 +5651,14 @@ function multiIpTypeLabel(value){return ({residential:'住宅',mobile:'移动',h
 function multiProbeLabel(value){return ({available:'可用',unavailable:'不可用',testing:'检测中',not_checked:'待检测'})[value]||'待检测';}
 function multiRowBackground(value){return value==='available'?'rgba(34,197,94,.16)':(value==='unavailable'?'rgba(239,68,68,.16)':'rgba(245,158,11,.17)');}
 function multiCandidateMatchesPolicy(node,policy){const t=node.ip_type||'unknown';if(policy==='residential_only')return t==='residential'||t==='mobile';if(policy==='hosting_only')return t==='hosting';return true;}
+function suggestedSocksPort(channel){
+  if(Number(channel.socks_port||0))return Number(channel.socks_port);
+  const used=new Set([80,443,2096,2097,7928,8787,...(multiExitData.config.channels||[]).flatMap(c=>[Number(c.inbound_port||0),Number(c.socks_port||0)])]);
+  let port=Number(channel.inbound_port||0)+10000;
+  if(port<1024||port>65535)port=20000;
+  while(used.has(port)&&port<65535)port++;
+  return port<=65535?port:19080;
+}
 function renderMultiExit(){
   const directBox=$("direct_node_row");
   const direct=multiExitData.direct||{};
@@ -5674,8 +5689,18 @@ function renderMultiExit(){
       <div class="channel-facts"><div><small>中转入口 · VPNGate 节点</small><strong>${esc(s.entry_ip||'尚未选定')}</strong>${esc(s.entry_provider||'选定节点后显示服务商')}</div><div><small>实际公网出口</small><strong>${esc(s.exit_ip||'尚未连接')}</strong>${esc(s.exit_provider||'连接验证后显示服务商')} · ${esc(multiIpTypeLabel(s.exit_ip_type))}</div></div>
       <div class="channel-state-note">${esc(c.awaiting_initial_test?'系统自动排队检测本国候选，找到首个合格节点后立即连接。':s.error||(ok?'出口正常，保持当前 IP；备用节点由后台维护。':'系统正在选择并验证本国出口。'))}</div>
       <div class="channel-fields"><label>出口国家<select data-field="country" class="input-field">${multiCountryOptions(c.country)}</select></label><label>入站端口<input data-field="inbound_port" type="number" min="1024" max="65535" class="input-field" value="${c.inbound_port}"></label><label>连接协议<select data-field="protocol" class="input-field"><option value="vless" ${c.protocol==='vless'?'selected':''}>VLESS</option><option value="trojan" ${c.protocol==='trojan'?'selected':''}>Trojan</option><option value="hysteria" ${(c.protocol||'hysteria')==='hysteria'?'selected':''}>HY2</option></select></label><label>IP 选择策略<select data-field="ip_type" class="input-field"><option value="all" ${c.ip_type==='all'?'selected':''}>全部 IP</option><option value="residential_preferred" ${c.ip_type==='residential_preferred'?'selected':''}>住宅优先</option><option value="residential_only" ${c.ip_type==='residential_only'?'selected':''}>仅住宅</option><option value="hosting_only" ${c.ip_type==='hosting_only'?'selected':''}>仅机房</option></select></label></div>
+      <div style="margin-top:14px;padding:14px;border:1px solid ${c.socks_enabled?'rgba(34,197,94,.55)':'var(--border-color)'};border-radius:10px;background:${c.socks_enabled?'rgba(34,197,94,.07)':'rgba(148,163,184,.04)'}">
+        <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap"><label style="display:flex;gap:8px;align-items:center;font-weight:700"><input data-field="socks_enabled" type="checkbox" ${c.socks_enabled?'checked':''} onchange="toggleChannelSocksFields('${esc(c.id)}')"> 启用指纹浏览器 SOCKS5</label><span style="font-size:12px;color:var(--text-secondary)">强制账号密码验证 · 固定跟随本线路出口</span></div>
+        <div data-socks-fields class="channel-fields" style="margin-top:12px">
+          <label>SOCKS5服务器<input class="input-field" value="${esc(c.socks_host||direct.exit_ip||'')}" readonly></label>
+          <label>SOCKS5端口<input data-field="socks_port" type="number" min="1024" max="65535" class="input-field" value="${suggestedSocksPort(c)}" ${c.socks_enabled?'':'disabled'}></label>
+          <label>用户名<input data-field="socks_username" class="input-field" value="${esc(c.socks_username||'')}" placeholder="留空则自动生成" ${c.socks_enabled?'':'disabled'}></label>
+          <label>密码<input data-field="socks_password" class="input-field" value="${esc(c.socks_password||'')}" placeholder="留空则自动生成" ${c.socks_enabled?'':'disabled'}></label>
+        </div>
+        <div style="margin-top:10px;font-size:12px;color:var(--warning)">SOCKS5本身不加密，请勿关闭身份验证；建议使用强密码，不要把账号分享给他人。</div>
+      </div>
       <details style="margin-top:14px;border:1px solid var(--border-color);border-radius:8px;overflow:hidden"><summary style="cursor:pointer;padding:10px 12px;background:rgba(255,255,255,.04)"><b style="font-size:13px">${esc(c.country)}候选 IP：${candidates.length} 个（可用 ${available}）</b><span style="font-size:11px;color:var(--text-secondary);margin-left:12px">默认折叠；健康节点保持连接，异常后才选择同国备用</span></summary><div style="overflow:auto;max-height:330px"><div style="display:grid;grid-template-columns:28px 1.2fr .8fr 1.2fr .7fr .7fr;gap:8px;padding:8px 10px;background:rgba(255,255,255,.05);font-size:11px;color:var(--text-secondary)"><span></span><span>IP</span><span>类型</span><span>服务商</span><span>状态</span><span>延迟</span></div>${rows||'<div style="padding:16px;color:var(--text-secondary)">暂无该国节点，请先点击顶部“更新节点资料”</div>'}</div></details>
-      <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:12px"><button class="toolbar-btn" onclick="saveMultiExitChannel('${esc(c.id)}')">保存并应用本线路</button><button class="toolbar-btn" onclick="testMultiExitChannel('${esc(c.id)}')">检测本国节点可用性</button><button class="toolbar-btn" onclick="switchMultiExitNode('${esc(c.id)}')">切换到所选 IP</button>${c.universal_node?`<button class="toolbar-btn" onclick="copyChannelNode('${esc(c.id)}','universal_node')">复制通用节点链接</button>`:''}${c.clash_node?`<button class="toolbar-btn" onclick="copyChannelNode('${esc(c.id)}','clash_node')">复制 Clash/Mihomo 节点配置</button>`:''}<button class="toolbar-btn" style="border-color:rgba(239,68,68,.7);color:#ef4444" onclick="deleteMultiExitChannel('${esc(c.id)}')">删除本国通道</button><span id="channel-message-${esc(c.id)}" style="font-size:12px;color:var(--text-secondary)"></span></div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:12px"><button class="toolbar-btn" onclick="saveMultiExitChannel('${esc(c.id)}')">保存并应用本线路</button><button class="toolbar-btn" onclick="testMultiExitChannel('${esc(c.id)}')">检测本国节点可用性</button><button class="toolbar-btn" onclick="switchMultiExitNode('${esc(c.id)}')">切换到所选 IP</button>${c.socks_enabled?`<button class="toolbar-btn" onclick="copyChannelSocks('${esc(c.id)}')">复制 SOCKS5 信息</button>`:''}${c.universal_node?`<button class="toolbar-btn" onclick="copyChannelNode('${esc(c.id)}','universal_node')">复制通用节点链接</button>`:''}${c.clash_node?`<button class="toolbar-btn" onclick="copyChannelNode('${esc(c.id)}','clash_node')">复制 Clash/Mihomo 节点配置</button>`:''}<button class="toolbar-btn" style="border-color:rgba(239,68,68,.7);color:#ef4444" onclick="deleteMultiExitChannel('${esc(c.id)}')">删除本国通道</button><span id="channel-message-${esc(c.id)}" style="font-size:12px;color:var(--text-secondary)"></span></div>
     </section>`;
   }).join("")||'<div style="color:var(--text-secondary)">尚未配置通道</div>';
   box.querySelectorAll('section[data-channel-card] details').forEach(details=>{
@@ -5743,6 +5768,7 @@ async function deleteMultiExitChannel(id){
 }
 function channelCard(id){return document.querySelector(`[data-channel-card="${CSS.escape(id)}"]`);}
 function channelMessage(id,text){const el=$("channel-message-"+id);if(el)el.textContent=text;}
+function toggleChannelSocksFields(id){const card=channelCard(id);if(!card)return;const enabled=card.querySelector('[data-field=socks_enabled]').checked;card.querySelectorAll('[data-socks-fields] input[data-field]').forEach(input=>input.disabled=!enabled);channelMessage(id,enabled?'SOCKS5已打开，请点击“保存并应用本线路”完成创建。':'SOCKS5已关闭，请点击“保存并应用本线路”删除公网监听。');}
 async function testMultiExitChannel(id){
   const startedAt=Date.now()/1000;channelMessage(id,'正在启动本国节点检测...');try{const r=await fetch('./api/test_multi_exit_channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel_id:id})});const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'启动失败');channelMessage(id,d.message);monitorChannelAvailability(id,startedAt);}catch(e){channelMessage(id,e.message);}
 }
@@ -5797,6 +5823,7 @@ async function copyText(value){
 }
 function copyDirectNode(kind){copyText((multiExitData.direct||{})[kind]||'');}
 function copyChannelNode(id,kind){const item=(multiExitData.config.channels||[]).find(c=>c.id===id);copyText((item||{})[kind]||'');}
+function copyChannelSocks(id){const item=(multiExitData.config.channels||[]).find(c=>c.id===id);if(!item||!item.socks_enabled){showCopyNotice('请先启用并保存SOCKS5',false);return;}copyText(`类型：SOCKS5\n服务器：${item.socks_host||''}\n端口：${item.socks_port||''}\n用户名：${item.socks_username||''}\n密码：${item.socks_password||''}\n链接：${item.socks_proxy_url||''}`);}
 function copyBundleSubscription(kind){copyText((multiExitData.bundle||{})[kind]||'');}
 async function saveDirectProtocol(){const protocol=($("direct_protocol")||{}).value;if(!protocol)return;const msg=$("multi_exit_message");msg.textContent='正在仅保存 VPS 直连协议...';try{const r=await fetch('./api/update_direct_protocol',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({protocol})});const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'保存失败');msg.textContent=d.message;await loadMultiExit();}catch(e){msg.textContent=e.message;}}
 async function saveMultiExit(){
@@ -5811,11 +5838,18 @@ async function saveMultiExitChannel(id){
   const preferredNodeId=original&&translateCountry(original.country)===translateCountry(country)?selectedNodeId:'';
   const candidate=preferredNodeId&&((original&&original.candidates)||[]).find(n=>n.id===preferredNodeId);
   if(preferredNodeId&&(!candidate||candidate.probe_status!=='available')){channelMessage(id,'所选 IP 当前不是“可用”状态，请先检测本国节点可用性');return;}
+  const socksEnabled=card.querySelector('[data-field=socks_enabled]').checked;
+  const socksPort=parseInt(card.querySelector('[data-field=socks_port]').value);
+  if(socksEnabled&&(!Number.isInteger(socksPort)||socksPort<1024||socksPort>65535)){channelMessage(id,'SOCKS5端口必须在1024至65535之间');return;}
   const payload={
     id,name:country,country,
     inbound_port:parseInt(card.querySelector('[data-field=inbound_port]').value),
     protocol:card.querySelector('[data-field=protocol]').value,
     ip_type:card.querySelector('[data-field=ip_type]').value,
+    socks_enabled:socksEnabled,
+    socks_port:socksPort,
+    socks_username:card.querySelector('[data-field=socks_username]').value.trim(),
+    socks_password:card.querySelector('[data-field=socks_password]').value,
   };
   if(preferredNodeId)payload.preferred_node_id=preferredNodeId;
   channelMessage(id,'\u6b63\u5728\u4fdd\u5b58\u5e76\u5207\u6362\u5f53\u524d\u7ebf\u8def...');
@@ -7851,6 +7885,10 @@ class Handler(BaseHTTPRequestHandler):
                 port = int(payload.get("inbound_port") or 0)
                 protocol = str(payload.get("protocol") or "hysteria").lower()
                 ip_type = str(payload.get("ip_type") or "all")
+                socks_enabled = payload.get("socks_enabled") is True
+                socks_port = int(payload.get("socks_port") or 0)
+                socks_username = str(payload.get("socks_username") or "").strip()
+                socks_password = str(payload.get("socks_password") or "")
                 if not country or not 1024 <= port <= 65535:
                     raise ValueError("国家或端口无效")
                 if protocol not in ("vless", "trojan", "hysteria"):
@@ -7879,12 +7917,42 @@ class Handler(BaseHTTPRequestHandler):
                     index = len(config.setdefault("channels", []))
                     updated = {"id": channel_id, "enabled": True, "preferred_node_id": ""}
                     config["channels"].append(updated)
-                if any(str(item.get("id")) != channel_id and int(item.get("inbound_port") or 0) == port for item in config.get("channels", [])):
-                    raise ValueError("该端口已被其他国家线路使用")
+                if socks_enabled:
+                    if not 1024 <= socks_port <= 65535 or socks_port == port:
+                        raise ValueError("SOCKS5端口无效，且不能与本线路节点端口相同")
+                    if not socks_username:
+                        socks_username = "fp_" + secrets.token_hex(4)
+                    if not socks_password:
+                        socks_password = secrets.token_urlsafe(16)
+                    if not re.fullmatch(r"[A-Za-z0-9_.-]{3,64}", socks_username):
+                        raise ValueError("SOCKS5用户名只能使用3-64位字母、数字、点、下划线或短横线")
+                    if not 10 <= len(socks_password) <= 128:
+                        raise ValueError("SOCKS5密码长度必须为10-128位")
+                for item in config.get("channels", []):
+                    if str(item.get("id")) == channel_id:
+                        continue
+                    occupied = {int(item.get("inbound_port") or 0)}
+                    if item.get("socks_enabled"):
+                        occupied.add(int(item.get("socks_port") or 0))
+                    if port in occupied:
+                        raise ValueError(f"节点端口 {port} 已被其他线路使用")
+                    if socks_enabled and socks_port in occupied:
+                        raise ValueError(f"SOCKS5端口 {socks_port} 已被其他线路使用")
+                old_socks_enabled = bool(updated.get("socks_enabled"))
+                old_socks_port = int(updated.get("socks_port") or 0)
+                old_preferred = str(updated.get("preferred_node_id") or "")
+                exit_changed = bool(
+                    is_new_channel or country_changed
+                    or str(updated.get("ip_type") or "all") != ip_type
+                )
                 inbound_changed = bool(
                     is_new_channel or country_changed
                     or int(updated.get("inbound_port") or 0) != port
                     or str(updated.get("protocol") or "hysteria").lower() != protocol
+                    or bool(updated.get("socks_enabled")) != socks_enabled
+                    or int(updated.get("socks_port") or 0) != socks_port
+                    or str(updated.get("socks_username") or "") != socks_username
+                    or str(updated.get("socks_password") or "") != socks_password
                 )
                 if is_new_channel or country_changed:
                     channel_name = generated_channel_name(country, country_nodes, protocol, port)
@@ -7895,7 +7963,9 @@ class Handler(BaseHTTPRequestHandler):
                 updated.update({
                     "id": channel_id, "name": channel_name,
                     "country": country, "inbound_port": port, "protocol": protocol,
-                    "ip_type": ip_type, "enabled": True, "restart_token": time.time(),
+                    "ip_type": ip_type, "enabled": True,
+                    "socks_enabled": socks_enabled, "socks_port": socks_port,
+                    "socks_username": socks_username, "socks_password": socks_password,
                 })
                 if preferred_was_supplied:
                     if requested_preferred and not any(
@@ -7912,6 +7982,10 @@ class Handler(BaseHTTPRequestHandler):
                     if requested_preferred and ip_type == "hosting_only" and selected_candidate.get("ip_type") != "hosting":
                         raise ValueError("当前线路仅允许机房 IP")
                     updated["preferred_node_id"] = requested_preferred
+                    if requested_preferred != old_preferred:
+                        exit_changed = True
+                if exit_changed:
+                    updated["restart_token"] = time.time()
                 if is_new_channel or country_changed:
                     updated["created_at"] = time.time()
                     updated["awaiting_initial_test"] = True
@@ -7935,6 +8009,13 @@ class Handler(BaseHTTPRequestHandler):
                     if "Status: active" in status.stdout:
                         transport = "udp" if protocol == "hysteria" else "tcp"
                         subprocess.run(["ufw", "allow", f"{port}/{transport}"], check=False, timeout=15)
+                        if old_socks_enabled and old_socks_port and (not socks_enabled or old_socks_port != socks_port):
+                            subprocess.run(
+                                ["ufw", "--force", "delete", "allow", f"{old_socks_port}/tcp"],
+                                check=False, timeout=15,
+                            )
+                        if socks_enabled:
+                            subprocess.run(["ufw", "allow", f"{socks_port}/tcp"], check=False, timeout=15)
                 if is_new_channel or country_changed:
                     ensure_channel_bootstrap(channel_id)
                     message = f"{country}线路已创建，正在优先检测本国节点；完成后会按所选 IP 类型自动连接"
@@ -7942,9 +8023,12 @@ class Handler(BaseHTTPRequestHandler):
                     wake_multi_exit_service()
                     selected_ip = str(selected_candidate.get("ip") or selected_candidate.get("remote_host") or requested_preferred)
                     message = f"本线路设置已保存，正在立即切换到 {selected_ip}；其他线路不受影响"
-                else:
+                elif exit_changed:
                     wake_multi_exit_service()
-                    message = f"{country}线路已单独保存并应用，其他国家配置未重建"
+                    message = f"{country}线路出口策略已保存并立即应用，其他线路不受影响"
+                else:
+                    socks_state = f"SOCKS5已启用：{public_subscription_host()}:{socks_port}" if socks_enabled else "SOCKS5已关闭"
+                    message = f"{country}线路已保存，{socks_state}；其他线路和当前出口连接不受影响"
                 self.send_json({"ok": True, "message": message, "initial_test_started": bool(is_new_channel or country_changed)})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
@@ -7991,6 +8075,11 @@ class Handler(BaseHTTPRequestHandler):
                             "ufw", "--force", "delete", "allow",
                             f"{int(channel.get('inbound_port') or 0)}/{transport}",
                         ], check=False, timeout=15)
+                        if channel.get("socks_enabled") and int(channel.get("socks_port") or 0):
+                            subprocess.run([
+                                "ufw", "--force", "delete", "allow",
+                                f"{int(channel.get('socks_port') or 0)}/tcp",
+                            ], check=False, timeout=15)
                 main_state = read_json(STATE_FILE, {})
                 channel_results = main_state.get("channel_test_results") or {}
                 channel_results.pop(channel_id, None)
@@ -8070,6 +8159,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(channels, list) or len(channels) > 12:
                     self.send_json({"ok": False, "error": "通道必须是列表，最多 12 条"}, HTTPStatus.BAD_REQUEST)
                     return
+                previous_config = read_multi_exit_config()
+                previous_channels = {
+                    str(item.get("id") or "").lower(): item
+                    for item in previous_config.get("channels", []) if isinstance(item, dict)
+                }
                 normalized = []
                 ids, ports = set(), set()
                 for index, item in enumerate(channels, 1):
@@ -8080,14 +8174,40 @@ class Handler(BaseHTTPRequestHandler):
                     port = int(item.get("inbound_port") or 0)
                     ip_type = str(item.get("ip_type") or "all")
                     protocol = str(item.get("protocol") or "hysteria").lower()
+                    previous = previous_channels.get(cid, {})
+                    socks_enabled = bool(item.get("socks_enabled", previous.get("socks_enabled", False)))
+                    socks_port = int(item.get("socks_port", previous.get("socks_port", 0)) or 0)
+                    socks_username = str(item.get("socks_username", previous.get("socks_username", "")) or "").strip()
+                    socks_password = str(item.get("socks_password", previous.get("socks_password", "")) or "")
                     if not cid or cid in ids or not country or port in ports or not 1024 <= port <= 65535:
                         raise ValueError("通道 ID、国家或端口无效/重复")
                     if ip_type not in ("all", "residential_preferred", "residential_only", "hosting_only"):
                         raise ValueError("IP 类型策略无效")
                     if protocol not in ("vless", "trojan", "hysteria"):
                         raise ValueError("Invalid channel protocol")
+                    if socks_enabled:
+                        if not 1024 <= socks_port <= 65535 or socks_port in ports or socks_port == port:
+                            raise ValueError("SOCKS5端口无效、重复或与节点端口冲突")
+                        if not socks_username:
+                            socks_username = "fp_" + secrets.token_hex(4)
+                        if not socks_password:
+                            socks_password = secrets.token_urlsafe(16)
+                        if not re.fullmatch(r"[A-Za-z0-9_.-]{3,64}", socks_username):
+                            raise ValueError("SOCKS5用户名格式无效")
+                        if not 10 <= len(socks_password) <= 128:
+                            raise ValueError("SOCKS5密码长度必须为10-128位")
                     ids.add(cid); ports.add(port)
-                    normalized.append({"id": cid, "name": str(item.get("name") or country + "线路")[:30], "inbound_port": port, "country": country, "protocol": protocol, "ip_type": ip_type, "enabled": bool(item.get("enabled", True))})
+                    if socks_enabled:
+                        ports.add(socks_port)
+                    normalized_item = dict(previous)
+                    normalized_item.update({
+                        "id": cid, "name": str(item.get("name") or previous.get("name") or country + "线路")[:30],
+                        "inbound_port": port, "country": country, "protocol": protocol,
+                        "ip_type": ip_type, "enabled": bool(item.get("enabled", True)),
+                        "socks_enabled": socks_enabled, "socks_port": socks_port,
+                        "socks_username": socks_username, "socks_password": socks_password,
+                    })
+                    normalized.append(normalized_item)
                 multi_dir = Path("/var/lib/aimilivpn-multiexit")
                 multi_dir.mkdir(parents=True, exist_ok=True)
                 write_json(multi_dir / "channels.json", {"version": 2, "direct_protocol": direct_protocol, "channels": normalized})
@@ -8108,6 +8228,8 @@ class Handler(BaseHTTPRequestHandler):
                         for item in normalized:
                             transport = "udp" if item["protocol"] == "hysteria" else "tcp"
                             subprocess.run(["ufw", "allow", f"{item['inbound_port']}/{transport}"], check=False, timeout=15)
+                            if item.get("socks_enabled"):
+                                subprocess.run(["ufw", "allow", f"{int(item['socks_port'])}/tcp"], check=False, timeout=15)
                 subprocess.run(["systemctl", "restart", "aimilivpn-multiexit"], check=False, timeout=20)
                 self.send_json({"ok": True, "message": "多国家通道已保存并重新加载"})
             except Exception as exc:
