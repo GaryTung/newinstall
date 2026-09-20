@@ -18,6 +18,9 @@ from pathlib import Path
 
 
 APP_DIR = Path(os.environ.get("VPNGATE_APP_DIR", "/opt/aimilivpn"))
+sys.path.insert(0, str(APP_DIR if (APP_DIR / "channel_network.py").exists() else Path(__file__).resolve().parent))
+from channel_network import channel_network, channel_slot, ensure_network_slots, managed_address
+from channel_policy import provider_rejection as channel_provider_rejection, failure_record, ip_type_rank as shared_ip_type_rank, effective_ip_type
 SOURCE_DATA = Path(os.environ.get("VPNGATE_DATA_DIR", "/var/lib/aimilivpn"))
 if not (SOURCE_DATA / "nodes.json").exists() and Path("/opt/aimilivpn/vpngate_data/nodes.json").exists():
     SOURCE_DATA = Path("/opt/aimilivpn/vpngate_data")
@@ -121,16 +124,18 @@ def mark_exit_verified(node_id, exit_ip, country_code="", provider="", ip_type="
     write_json(VERIFIED_EXITS_FILE, records)
 
 
-def mark_deep_failure(node_id, error):
+def mark_deep_failure(node_id, error, channel_id=""):
     """Record that a reachable endpoint failed the complete VPN exit test."""
     node_id = str(node_id or "")
     if not node_id:
         return
     records = deep_failure_records()
-    previous = dict(records.get(node_id) or {})
+    key = f"{channel_id}:{node_id}" if channel_id else node_id
+    previous = dict(records.get(key) or {})
     failures = int(previous.get("failures") or 0) + 1
     now = time.time()
-    records[node_id] = {
+    records[key] = {
+        "channel_id": channel_id,
         "status": "deep_unavailable",
         "failures": failures,
         "failed_at": now,
@@ -138,17 +143,16 @@ def mark_deep_failure(node_id, error):
         "error": str(error or "完整 VPN 出口验证失败")[-500:],
     }
     write_json(DEEP_FAILURES_FILE, records)
-    verified = verified_exit_records()
-    if node_id in verified:
-        verified.pop(node_id, None)
-        write_json(VERIFIED_EXITS_FILE, verified)
+    # One channel's failure must not erase another channel's verified exit.
 
 
-def clear_deep_failure(node_id):
+def clear_deep_failure(node_id, channel_id=""):
     records = deep_failure_records()
     node_id = str(node_id or "")
-    if node_id in records:
-        records.pop(node_id, None)
+    keys = {node_id, f"{channel_id}:{node_id}"} if channel_id else {node_id}
+    if any(key in records for key in keys):
+        for key in keys:
+            records.pop(key, None)
         write_json(DEEP_FAILURES_FILE, records)
 
 
@@ -184,16 +188,9 @@ def load_config():
         item["ip_type"] = str(item.get("ip_type") or "all").strip()
         channels.append(item)
     cfg["channels"] = channels
+    if ensure_network_slots(cfg):
+        write_json(CONFIG_FILE, cfg)
     return cfg
-
-
-def channel_network(index):
-    # One /30 per channel: host=.1, namespace=.2
-    slot = index - 1
-    third = 200 + (slot // 60)
-    fourth = (slot % 60) * 4
-    base = f"10.253.{third}.{fourth}"
-    return f"10.253.{third}.{fourth}/30", f"10.253.{third}.{fourth + 1}", f"10.253.{third}.{fourth + 2}"
 
 
 def ns_name(channel):
@@ -253,9 +250,20 @@ def remove_channel_namespace(channel_id, runtime):
     run(["ip", "link", "del", host_if], check=False)
 
 
+def reconcile_interface_address(prefix, interface, address):
+    result = run([*prefix, "ip", "-j", "-4", "addr", "show", "dev", interface], capture=True)
+    for link in json.loads(result.stdout or "[]"):
+        for info in link.get("addr_info", []):
+            old = str(info.get("local") or "")
+            if managed_address(old) and (old != address or info.get("prefixlen") != 30):
+                run([*prefix, "ip", "addr", "del", f"{old}/{info['prefixlen']}", "dev", interface])
+    run([*prefix, "ip", "addr", "replace", f"{address}/30", "dev", interface])
+
+
 def ensure_namespace(channel, index):
     ns = ns_name(channel)
-    _, host_ip, ns_ip = channel_network(index)
+    slot = channel_slot(channel, index)
+    _, host_ip, ns_ip = channel_network(slot)
     host_if = ("vh-" + channel["id"])[:15]
     ns_if = ("vn-" + channel["id"])[:15]
     existing = run(["ip", "netns", "list"], check=False, capture=True).stdout
@@ -264,14 +272,14 @@ def ensure_namespace(channel, index):
     if run(["ip", "link", "show", host_if], check=False).returncode != 0:
         run(["ip", "link", "add", host_if, "type", "veth", "peer", "name", ns_if])
         run(["ip", "link", "set", ns_if, "netns", ns])
-    run(["ip", "addr", "replace", f"{host_ip}/30", "dev", host_if])
+    reconcile_interface_address([], host_if, host_ip)
     run(["ip", "link", "set", host_if, "up"])
     run(["ip", "netns", "exec", ns, "ip", "link", "set", "lo", "up"])
-    run(["ip", "netns", "exec", ns, "ip", "addr", "replace", f"{ns_ip}/30", "dev", ns_if])
+    reconcile_interface_address(["ip", "netns", "exec", ns], ns_if, ns_ip)
     run(["ip", "netns", "exec", ns, "ip", "link", "set", ns_if, "up"])
     run(["ip", "netns", "exec", ns, "ip", "route", "replace", "default", "via", host_ip])
     run(["sysctl", "-w", "net.ipv4.ip_forward=1"], check=False)
-    subnet, _, _ = channel_network(index)
+    subnet, _, _ = channel_network(slot)
     check_nat = run(["iptables", "-t", "nat", "-C", "POSTROUTING", "-s", subnet, "-j", "MASQUERADE"], check=False)
     if check_nat.returncode != 0:
         run(["iptables", "-t", "nat", "-A", "POSTROUTING", "-s", subnet, "-j", "MASQUERADE"])
@@ -279,6 +287,10 @@ def ensure_namespace(channel, index):
         check_fwd = run(["iptables", "-C", "FORWARD", direction[0], direction[1], "-j", "ACCEPT"], check=False)
         if check_fwd.returncode != 0:
             run(["iptables", "-A", "FORWARD", direction[0], direction[1], "-j", "ACCEPT"])
+    route = run(["ip", "-j", "route", "get", ns_ip], capture=True)
+    routes = json.loads(route.stdout or "[]")
+    if not routes or routes[0].get("dev") != host_if:
+        raise RuntimeError("本机通道内部路由冲突，已停止连接尝试；请执行后台升级修复网段")
     return ns, ns_ip
 
 
@@ -334,16 +346,7 @@ def korea_kt_rejection(channel, node=None, provider="", asn=""):
 
 
 def ip_type_rank(node, mode):
-    value = str(node.get("exit_ip_type") or node.get("ip_type") or "unknown").lower()
-    residential = value in {"residential", "mobile", "住宅", "移动"}
-    hosting = value in {"hosting", "datacenter", "机房"}
-    if mode == "residential_only":
-        return 0 if residential else 99
-    if mode == "hosting_only":
-        return 0 if hosting else 99
-    if mode == "residential_preferred":
-        return 0 if residential else (1 if not hosting else 2)
-    return 0
+    return shared_ip_type_rank(node, mode)
 
 
 def history_entry(history, node_id):
@@ -401,11 +404,9 @@ def select_candidates(channel, exclude=None, history=None, recovery=False):
         nid = str(node.get("id") or "")
         if not nid or nid in exclude or not country_matches(node, channel["country"]):
             continue
-        if japan_kddi_rejection(channel, node=node):
+        if channel_provider_rejection(channel, node=node):
             continue
-        if korea_kt_rejection(channel, node=node):
-            continue
-        deep_failure = deep_failures.get(nid) or {}
+        deep_failure = failure_record(deep_failures, nid, str(channel.get("id") or ""))
         if nid != preferred and float(deep_failure.get("blocked_until") or 0) > now:
             continue
         node_history = history.get(nid, {})
@@ -446,7 +447,7 @@ def select_candidates(channel, exclude=None, history=None, recovery=False):
 def channel_signature(channel):
     value = {
         key: channel.get(key)
-        for key in ("country", "ip_type", "preferred_node_id", "restart_token", "enabled")
+        for key in ("country", "ip_type", "preferred_node_id", "restart_token", "enabled", "network_slot")
     }
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
 
@@ -538,9 +539,9 @@ def enforce_exit_ip_type(channel, exit_ip, info):
     actual_ip = str(info.get("ip") or "")
     if actual_ip and actual_ip != exit_ip:
         raise RuntimeError(f"IPPure出口 {actual_ip} 与实际出口 {exit_ip} 不一致")
-    if exit_ip in FORCED_HOSTING_EXIT_IPS:
+    if effective_ip_type({"ip": exit_ip, "ip_type": info.get("ip_type")}) == "hosting" and info.get("ip_type") != "hosting":
         info["ip_type"] = "hosting"
-        info["classification_source"] = "ping0-exact-ip-override"
+        info["classification_source"] = "known-hosting-override"
     ip_type = str(info.get("ip_type") or "")
     if mode == "residential_only" and ip_type != "residential":
         raise RuntimeError(f"真实出口 {exit_ip} 经IPPure判定为非住宅IP，已拒绝用于仅住宅线路")
@@ -598,7 +599,13 @@ def connect_channel(channel, index, previous, history):
         # Live retries remain rate-limited by last_failure_at.
         candidates = select_candidates(channel, history=history, recovery=True)
     if not candidates:
-        raise RuntimeError(f"没有找到 {channel['country']} 候选节点，请先在主后台更新节点资料")
+        pool = [n for n in read_json(NODES_FILE, []) if country_matches(n, channel['country'])]
+        policy = [n for n in pool if not channel_provider_rejection(channel, node=n) and ip_type_rank(n, channel.get('ip_type', 'all')) < 99]
+        available = [n for n in policy if n.get('probe_status') == 'available']
+        raise RuntimeError(
+            f"{channel['country']}候选共 {len(pool)} 个，符合服务商/IP策略 {len(policy)} 个，"
+            f"其中探测可用 {len(available)} 个；当前无可尝试节点（待检测或完整连接失败冷却中）"
+        )
     last_error = ""
     for node in candidates[:MAX_CONNECT_CANDIDATES]:
         vpn = None
@@ -627,7 +634,7 @@ def connect_channel(channel, index, previous, history):
                 raise RuntimeError(provider_rejection)
             enforce_exit_ip_type(channel, detail, exit_info)
             record_node_success(history, node.get("id"))
-            clear_deep_failure(node.get("id"))
+            clear_deep_failure(node.get("id"), channel["id"])
             mark_exit_verified(
                 node.get("id"), detail, actual_country_code,
                 exit_info.get("provider", ""), exit_info.get("ip_type", ""),
@@ -655,7 +662,7 @@ def connect_channel(channel, index, previous, history):
             failed_id = str(node.get("id") or "")
             failed.append(failed_id)
             record_node_failure(history, failed_id)
-            mark_deep_failure(failed_id, last_error)
+            mark_deep_failure(failed_id, last_error, channel["id"])
     raise RuntimeError(last_error or "所有候选节点连接失败")
 
 
@@ -667,13 +674,15 @@ def daemon():
     if int(state.get("history_policy_version") or 0) < 1:
         state["node_history"] = {}
         state["history_policy_version"] = 1
-    history = state.setdefault("node_history", {})
+    legacy_history = state.setdefault("node_history", {})
+    channel_histories = state.setdefault("channel_node_history", {})
     first_pass = True
     while True:
         cfg = load_config()
         desired = {c["id"]: c for c in cfg["channels"] if c.get("enabled")}
         for cid, runtime in list(state.get("channels", {}).items()):
             if cid not in desired:
+                history = channel_histories.setdefault(cid, {})
                 record_runtime_end(history, runtime, failed=False)
                 remove_channel_namespace(cid, runtime)
                 state["channels"].pop(cid, None)
@@ -706,6 +715,9 @@ def daemon():
         for index, channel in enumerate(cfg["channels"], 1):
             if not channel.get("enabled"):
                 continue
+            if channel["id"] not in channel_histories:
+                channel_histories[channel["id"]] = json.loads(json.dumps(legacy_history))
+            history = channel_histories[channel["id"]]
             runtime = state.setdefault("channels", {}).get(channel["id"], {})
             if channel.get("awaiting_initial_test"):
                 stop_runtime(runtime)
@@ -728,7 +740,7 @@ def daemon():
                 asn=runtime.get("exit_asn", ""),
             )
             if healthy and provider_rejection:
-                mark_deep_failure(runtime.get("node_id"), provider_rejection)
+                mark_deep_failure(runtime.get("node_id"), provider_rejection, channel["id"])
                 record_runtime_end(history, runtime, failed=False)
                 healthy = False
                 runtime.update({"status": "switching", "error": provider_rejection})
@@ -738,7 +750,7 @@ def daemon():
                 asn=runtime.get("exit_asn", ""),
             )
             if healthy and provider_rejection:
-                mark_deep_failure(runtime.get("node_id"), provider_rejection)
+                mark_deep_failure(runtime.get("node_id"), provider_rejection, channel["id"])
                 record_runtime_end(history, runtime, failed=False)
                 healthy = False
                 runtime.update({"status": "switching", "error": provider_rejection})
@@ -748,7 +760,7 @@ def daemon():
             )
             if healthy and forced_exit_rejection:
                 reason = f"真实出口 {runtime.get('exit_ip')} 已按 Ping0 精确规则判定为机房IP"
-                mark_deep_failure(runtime.get("node_id"), reason)
+                mark_deep_failure(runtime.get("node_id"), reason, channel["id"])
                 record_runtime_end(history, runtime, failed=False)
                 healthy = False
                 runtime.update({
@@ -775,13 +787,14 @@ def daemon():
                             "status": "connected", "exit_ip": detail, "error": "",
                             "consecutive_health_failures": 0,
                         })
+                        clear_deep_failure(runtime.get("node_id"), channel["id"])
                         mark_exit_verified(
                             runtime.get("node_id"), detail, runtime.get("exit_country_code", ""),
                             runtime.get("exit_provider", ""), runtime.get("exit_ip_type", ""),
                         )
                     except Exception as exc:
                         healthy = False
-                        mark_deep_failure(runtime.get("node_id"), str(exc))
+                        mark_deep_failure(runtime.get("node_id"), str(exc), channel["id"])
                         record_runtime_end(history, runtime, failed=True)
                         runtime.update({
                             "status": "failed", "error": str(exc)[-500:], "exit_ip": "", "exit_country_code": "",
@@ -793,7 +806,7 @@ def daemon():
                     runtime["consecutive_health_failures"] = failures
                     if failures >= HEALTH_FAILURE_THRESHOLD:
                         healthy = False
-                        mark_deep_failure(runtime.get("node_id"), detail)
+                        mark_deep_failure(runtime.get("node_id"), detail, channel["id"])
                         record_runtime_end(history, runtime, failed=True)
                         runtime.update({
                             "status": "failed", "error": detail, "exit_ip": "", "exit_country_code": "",
@@ -815,7 +828,7 @@ def daemon():
                         old_entry["consecutive_failures"] = 0
                         old_entry["cooldown_until"] = 0
                     else:
-                        mark_deep_failure(previous.get("node_id"), "VPN 进程异常退出")
+                        mark_deep_failure(previous.get("node_id"), "VPN 进程异常退出", channel["id"])
                         record_runtime_end(history, previous, failed=True)
                 stop_runtime(runtime)
                 stop_namespace_processes(ns_name(channel))

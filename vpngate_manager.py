@@ -81,6 +81,8 @@ class DualStackHTTPServer(ThreadingHTTPServer):
 
 import vpn_utils
 import proxy_server
+from channel_network import ensure_network_slots
+from channel_policy import candidate_rejection, effective_ip_type, failure_record, ip_type_rank
 
 def env_int(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
     raw = os.environ.get(name)
@@ -234,6 +236,8 @@ def upstream_proxy_auth_file() -> str | None:
 
 def write_json(path: Path, data: Any) -> None:
     with lock:
+        if path == MULTI_EXIT_DIR / "channels.json":
+            ensure_network_slots(data)
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(path)
@@ -629,13 +633,19 @@ def channel_candidate_nodes(channel: dict[str, Any], source: list[dict[str, Any]
             "host_name": str(node.get("host_name") or ""),
             "country": normalized_country_name(node.get("country")),
             "owner": str(node.get("owner") or node.get("as_name") or node.get("org") or ""),
-            "ip_type": effective_node_ip_type(node) or "unknown",
+            "ip_type": effective_ip_type(node),
+            "asn": str(node.get("asn") or ""),
+            "exit_asn": str(node.get("exit_asn") or ""),
+            "exit_owner": str(node.get("exit_owner") or node.get("exit_provider") or ""),
+            "exit_as_name": str(node.get("exit_as_name") or ""),
             "probe_status": str(node.get("probe_status") or "not_checked"),
             "probe_message": str(node.get("probe_message") or ""),
             "latency_ms": parse_int(node.get("latency_ms")) or parse_int(node.get("ping")),
             "score": parse_int(node.get("score")),
         }
-        deep_failure = deep_failures.get(candidate["id"]) or {}
+        candidate["policy_rejection"] = candidate_rejection(channel, node)
+        candidate["policy_eligible"] = not candidate["policy_rejection"]
+        deep_failure = failure_record(deep_failures, candidate["id"], channel.get("id"))
         if float(deep_failure.get("blocked_until") or 0) > now:
             candidate["probe_status"] = "unavailable"
             candidate["probe_message"] = "端口可达但完整 VPN 出口失败：" + str(deep_failure.get("error") or "验证失败")
@@ -647,6 +657,7 @@ def channel_candidate_nodes(channel: dict[str, Any], source: list[dict[str, Any]
         candidates.append(candidate)
     status_order = {"available": 0, "not_checked": 1, "testing": 2, "unavailable": 3}
     candidates.sort(key=lambda n: (
+        1 if n["policy_rejection"] else 0,
         status_order.get(n["probe_status"], 2),
         0 if n["ip_type"] in ("residential", "mobile") else 1,
         n["latency_ms"] or 999999,
@@ -656,17 +667,7 @@ def channel_candidate_nodes(channel: dict[str, Any], source: list[dict[str, Any]
 
 
 def channel_ip_type_rank(node: dict[str, Any], channel: dict[str, Any]) -> int:
-    mode = str(channel.get("ip_type") or "all")
-    value = effective_node_ip_type(node) or "unknown"
-    residential = value in ("residential", "mobile")
-    hosting = value == "hosting"
-    if mode == "residential_only":
-        return 0 if residential else 99
-    if mode == "hosting_only":
-        return 0 if hosting else 99
-    if mode == "residential_preferred":
-        return 0 if residential else (2 if hosting else 1)
-    return 0
+    return ip_type_rank(node, str(channel.get("ip_type") or "all"))
 
 
 def channel_source_candidates(channel: dict[str, Any]) -> list[dict[str, Any]]:
@@ -677,8 +678,16 @@ def channel_source_candidates(channel: dict[str, Any]) -> list[dict[str, Any]]:
     candidates = [
         node for node in source
         if country_matches(node.get("country"), channel.get("country"))
-        and channel_ip_type_rank(node, channel) < 99
+        and not candidate_rejection(channel, node)
     ]
+    deep_failures = read_json(MULTI_EXIT_DEEP_FAILURES_FILE, {})
+    now = time.time()
+    for node in candidates:
+        failed = failure_record(deep_failures, node.get("id"), channel.get("id"))
+        blocked_until = float(failed.get("blocked_until") or 0)
+        if blocked_until > now:
+            node["probe_status"] = "unavailable"
+            node["next_probe_at"] = max(float(node.get("next_probe_at") or 0), blocked_until)
     candidates.sort(key=lambda node: (
         0 if str(node.get("id") or "") == preferred else 1,
         channel_ip_type_rank(node, channel),
@@ -814,6 +823,7 @@ def run_channel_availability(channel_id: str) -> str:
         available_ids = {
             str(node.get("id") or "") for node in read_nodes()
             if str(node.get("id") or "") in set(ids) and node.get("probe_status") == "available"
+            and not candidate_rejection(channel, node)
         }
     if available_ids:
         mark_channel_ready(channel_id)
@@ -828,7 +838,7 @@ def policy_available_channel_nodes(channel: dict[str, Any]) -> list[dict[str, An
     return [
         node for node in channel_source_candidates(channel)
         if node.get("probe_status") == "available"
-        and float((deep_failures.get(str(node.get("id") or "")) or {}).get("blocked_until") or 0) <= now
+        and float(failure_record(deep_failures, node.get("id"), channel.get("id")).get("blocked_until") or 0) <= now
     ]
 
 
@@ -1006,7 +1016,8 @@ def bootstrap_new_channel(channel_id: str) -> None:
                 time.sleep(2)
                 continue
             attempted.update(str(node.get("id") or "") for node in tested)
-            winner = next((node for node in tested if node.get("probe_status") == "available"), None)
+            winner = next((node for node in tested if node.get("probe_status") == "available"
+                           and not candidate_rejection(channel, node)), None)
             if winner:
                 mark_channel_ready(channel_id, str(winner.get("id") or ""))
                 print(
@@ -5650,7 +5661,7 @@ function multiProtocolLabel(value){return value==='hysteria'?'HY2':(value==='tro
 function multiIpTypeLabel(value){return ({residential:'住宅',mobile:'移动',hosting:'机房',unknown:'未知'})[value]||value||'未知';}
 function multiProbeLabel(value){return ({available:'可用',unavailable:'不可用',testing:'检测中',not_checked:'待检测'})[value]||'待检测';}
 function multiRowBackground(value){return value==='available'?'rgba(34,197,94,.16)':(value==='unavailable'?'rgba(239,68,68,.16)':'rgba(245,158,11,.17)');}
-function multiCandidateMatchesPolicy(node,policy){const t=node.ip_type||'unknown';if(policy==='residential_only')return t==='residential'||t==='mobile';if(policy==='hosting_only')return t==='hosting';return true;}
+function multiCandidateMatchesPolicy(node,policy){if(node.policy_rejection)return false;const t=node.ip_type||'unknown';if(policy==='residential_only')return t==='residential'||t==='mobile';if(policy==='hosting_only')return t==='hosting';return true;}
 function suggestedSocksPort(channel){
   if(Number(channel.socks_port||0))return Number(channel.socks_port);
   const used=new Set([80,443,2096,2097,7928,8787,...(multiExitData.config.channels||[]).flatMap(c=>[Number(c.inbound_port||0),Number(c.socks_port||0)])]);
@@ -5679,10 +5690,11 @@ function renderMultiExit(){
   box.innerHTML=(multiExitData.config.channels||[]).map((c,i)=>{
     const s=runtime[c.id]||{}; const status=s.status||(c.awaiting_initial_test?'testing':'connecting'); const ok=status==="connected"; const pending=['connecting','switching','testing'].includes(status); const candidates=c.candidates||[];
     const available=candidates.filter(n=>n.probe_status==='available'&&multiCandidateMatchesPolicy(n,c.ip_type)).length;
+    const excluded=candidates.filter(n=>n.policy_rejection).length;
     const selectedNodeId=multiExitSelectedNodes[c.id]||c.preferred_node_id||s.node_id||'';
-    const rows=candidates.map(n=>{const current=n.id===s.node_id;const preferred=n.id===c.preferred_node_id;const checked=n.id===selectedNodeId;return `<label style="display:grid;grid-template-columns:28px 1.2fr .8fr 1.2fr .7fr .7fr;gap:8px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--border-color);border-left:4px solid ${n.probe_status==='available'?'#22c55e':(n.probe_status==='unavailable'?'#ef4444':'#f59e0b')};font-size:12px;background:${multiRowBackground(n.probe_status)};${current?'font-weight:700;outline:1px solid rgba(59,130,246,.55);outline-offset:-1px;':''}">
-      <input type="radio" name="candidate-${esc(c.id)}" value="${esc(n.id)}" ${checked?'checked':''} onchange="rememberMultiExitCandidate('${esc(c.id)}','${esc(n.id)}')">
-      <span>${esc(n.ip||n.entry_ip||'-')}${current?' <b style="color:var(--success)">当前</b>':''}</span><span>${esc(multiIpTypeLabel(n.ip_type))}</span><span title="${esc(n.owner||'')}">${esc(n.owner||'-')}</span><span>${esc(multiProbeLabel(n.probe_status))}</span><span>${n.latency_ms?esc(n.latency_ms+' ms'):'-'}</span></label>`;}).join('');
+    const rows=candidates.map(n=>{const current=n.id===s.node_id;const preferred=n.id===c.preferred_node_id;const checked=n.id===selectedNodeId;const rejection=n.policy_rejection||'';return `<label title="${esc(rejection||n.probe_message||'')}" style="display:grid;grid-template-columns:28px 1.2fr .8fr 1.2fr .7fr .7fr;gap:8px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--border-color);border-left:4px solid ${rejection?'#94a3b8':n.probe_status==='available'?'#22c55e':(n.probe_status==='unavailable'?'#ef4444':'#f59e0b')};font-size:12px;background:${rejection?'rgba(148,163,184,.10)':multiRowBackground(n.probe_status)};${current?'font-weight:700;outline:1px solid rgba(59,130,246,.55);outline-offset:-1px;':''}">
+      <input type="radio" name="candidate-${esc(c.id)}" value="${esc(n.id)}" ${checked?'checked':''} ${rejection?'disabled':''} onchange="rememberMultiExitCandidate('${esc(c.id)}','${esc(n.id)}')">
+      <span>${esc(n.ip||n.entry_ip||'-')}${current?' <b style="color:var(--success)">当前</b>':''}</span><span>${esc(multiIpTypeLabel(n.ip_type))}</span><span title="${esc(n.owner||'')}">${esc(n.owner||'-')}</span><span>${rejection?'策略排除':esc(multiProbeLabel(n.probe_status))}</span><span>${n.latency_ms?esc(n.latency_ms+' ms'):'-'}</span>${rejection?'<span style="grid-column:2/-1;color:var(--text-secondary)">'+esc(rejection)+'</span>':''}</label>`;}).join('');
     const stateLabel=ok?'已连接':(c.awaiting_initial_test?'等待 / 首次检测':status==='testing'?'正在检测':pending?'正在连接':'断线恢复中');
     return `<section class="country-card" data-health="${ok?'connected':pending?'pending':'failed'}" data-channel-card="${esc(c.id)}">
       <div style="display:flex;justify-content:space-between;gap:12px;align-items:center"><div><strong style="font-size:20px">${esc(c.country||c.name||c.id)}</strong><span style="font-size:12px;color:var(--text-secondary);margin-left:12px">${esc(multiProtocolLabel(c.protocol))} · ${esc(c.inbound_port)}</span></div><span class="badge ${ok?'available':(pending?'testing':'unavailable')}">${stateLabel}</span></div>
@@ -5699,7 +5711,7 @@ function renderMultiExit(){
         </div>
         <div style="margin-top:10px;font-size:12px;color:var(--warning)">SOCKS5本身不加密，请勿关闭身份验证；建议使用强密码，不要把账号分享给他人。</div>
       </div>
-      <details style="margin-top:14px;border:1px solid var(--border-color);border-radius:8px;overflow:hidden"><summary style="cursor:pointer;padding:10px 12px;background:rgba(255,255,255,.04)"><b style="font-size:13px">${esc(c.country)}候选 IP：${candidates.length} 个（可用 ${available}）</b><span style="font-size:11px;color:var(--text-secondary);margin-left:12px">默认折叠；健康节点保持连接，异常后才选择同国备用</span></summary><div style="overflow:auto;max-height:330px"><div style="display:grid;grid-template-columns:28px 1.2fr .8fr 1.2fr .7fr .7fr;gap:8px;padding:8px 10px;background:rgba(255,255,255,.05);font-size:11px;color:var(--text-secondary)"><span></span><span>IP</span><span>类型</span><span>服务商</span><span>状态</span><span>延迟</span></div>${rows||'<div style="padding:16px;color:var(--text-secondary)">暂无该国节点，请先点击顶部“更新节点资料”</div>'}</div></details>
+      <details style="margin-top:14px;border:1px solid var(--border-color);border-radius:8px;overflow:hidden"><summary style="cursor:pointer;padding:10px 12px;background:rgba(255,255,255,.04)"><b style="font-size:13px">${esc(c.country)}候选 IP：${candidates.length} 个（符合策略可用 ${available} · 策略排除 ${excluded}）</b><span style="font-size:11px;color:var(--text-secondary);margin-left:12px">可用为端口检测结果；连接时再验证完整出口</span></summary><div style="overflow:auto;max-height:330px"><div style="display:grid;grid-template-columns:28px 1.2fr .8fr 1.2fr .7fr .7fr;gap:8px;padding:8px 10px;background:rgba(255,255,255,.05);font-size:11px;color:var(--text-secondary)"><span></span><span>IP</span><span>类型</span><span>服务商</span><span>状态</span><span>延迟</span></div>${rows||'<div style="padding:16px;color:var(--text-secondary)">暂无该国节点，请先点击顶部“更新节点资料”</div>'}</div></details>
       <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:12px"><button class="toolbar-btn" onclick="saveMultiExitChannel('${esc(c.id)}')">保存并应用本线路</button><button class="toolbar-btn" onclick="testMultiExitChannel('${esc(c.id)}')">检测本国节点可用性</button><button class="toolbar-btn" onclick="switchMultiExitNode('${esc(c.id)}')">切换到所选 IP</button>${c.socks_enabled?`<button class="toolbar-btn" onclick="copyChannelSocks('${esc(c.id)}')">复制 SOCKS5 信息</button>`:''}${c.universal_node?`<button class="toolbar-btn" onclick="copyChannelNode('${esc(c.id)}','universal_node')">复制通用节点链接</button>`:''}${c.clash_node?`<button class="toolbar-btn" onclick="copyChannelNode('${esc(c.id)}','clash_node')">复制 Clash/Mihomo 节点配置</button>`:''}<button class="toolbar-btn" style="border-color:rgba(239,68,68,.7);color:#ef4444" onclick="deleteMultiExitChannel('${esc(c.id)}')">删除本国通道</button><span id="channel-message-${esc(c.id)}" style="font-size:12px;color:var(--text-secondary)"></span></div>
     </section>`;
   }).join("")||'<div style="color:var(--text-secondary)">尚未配置通道</div>';
@@ -5837,6 +5849,7 @@ async function saveMultiExitChannel(id){
   const original=(multiExitData.config.channels||[]).find(item=>item.id===id);
   const preferredNodeId=original&&translateCountry(original.country)===translateCountry(country)?selectedNodeId:'';
   const candidate=preferredNodeId&&((original&&original.candidates)||[]).find(n=>n.id===preferredNodeId);
+  if(candidate&&candidate.policy_rejection){channelMessage(id,candidate.policy_rejection);return;}
   if(preferredNodeId&&(!candidate||candidate.probe_status!=='available')){channelMessage(id,'所选 IP 当前不是“可用”状态，请先检测本国节点可用性');return;}
   const socksEnabled=card.querySelector('[data-field=socks_enabled]').checked;
   const socksPort=parseInt(card.querySelector('[data-field=socks_port]').value);
@@ -7895,7 +7908,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("协议必须是 VLESS、Trojan 或 HY2")
                 if ip_type not in ("all", "residential_preferred", "residential_only", "hosting_only"):
                     raise ValueError("IP 类型策略无效")
-                country_nodes = channel_candidate_nodes({"country": country})
+                country_nodes = channel_candidate_nodes({"id": channel_id, "country": country, "ip_type": ip_type})
                 preferred_was_supplied = "preferred_node_id" in payload
                 requested_preferred = str(payload.get("preferred_node_id") or "").strip()
                 if not country_nodes:
@@ -7977,10 +7990,8 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     if requested_preferred and selected_candidate.get("probe_status") != "available":
                         raise ValueError("所选 IP 当前不是可用状态，请先检测本国节点可用性")
-                    if requested_preferred and ip_type == "residential_only" and selected_candidate.get("ip_type") not in ("residential", "mobile"):
-                        raise ValueError("当前线路仅允许住宅 IP")
-                    if requested_preferred and ip_type == "hosting_only" and selected_candidate.get("ip_type") != "hosting":
-                        raise ValueError("当前线路仅允许机房 IP")
+                    if requested_preferred and selected_candidate.get("policy_rejection"):
+                        raise ValueError(str(selected_candidate["policy_rejection"]))
                     updated["preferred_node_id"] = requested_preferred
                     if requested_preferred != old_preferred:
                         exit_changed = True
@@ -8107,11 +8118,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("所选 IP 不属于当前国家")
                 if candidate.get("probe_status") != "available":
                     raise ValueError("所选 IP 当前不是可用状态，请先检测本国节点可用性")
-                mode = str(channel.get("ip_type") or "all")
-                if mode == "residential_only" and candidate.get("ip_type") not in ("residential", "mobile"):
-                    raise ValueError("当前线路仅允许住宅 IP")
-                if mode == "hosting_only" and candidate.get("ip_type") != "hosting":
-                    raise ValueError("当前线路仅允许机房 IP")
+                if candidate.get("policy_rejection"):
+                    raise ValueError(str(candidate["policy_rejection"]))
                 channel["preferred_node_id"] = node_id
                 channel["restart_token"] = time.time()
                 config["channels"][index] = channel
@@ -8210,7 +8218,7 @@ class Handler(BaseHTTPRequestHandler):
                     normalized.append(normalized_item)
                 multi_dir = Path("/var/lib/aimilivpn-multiexit")
                 multi_dir.mkdir(parents=True, exist_ok=True)
-                write_json(multi_dir / "channels.json", {"version": 2, "direct_protocol": direct_protocol, "channels": normalized})
+                write_json(multi_dir / "channels.json", {**previous_config, "version": max(4, int(previous_config.get("version") or 1)), "direct_protocol": direct_protocol, "channels": normalized})
                 provision = Path("/usr/local/sbin/xui-multi-provision")
                 if provision.exists() and Path("/etc/x-ui/x-ui.db").exists():
                     subprocess.run(["systemctl", "stop", "x-ui"], check=True, timeout=20)

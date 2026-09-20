@@ -11,7 +11,7 @@ fail() { printf '多国家出口安装失败：%s\n' "$*" >&2; exit 1; }
 [[ -x /usr/local/x-ui/x-ui && -f /etc/x-ui/x-ui.db ]] || fail "未检测到 3x-ui，请先执行统一安装器"
 [[ -f "${APP_DIR}/proxy_server.py" ]] || fail "未检测到节点管理系统"
 
-for file in multi_exit_manager.py xui_multi_provision.py; do
+for file in multi_exit_manager.py xui_multi_provision.py channel_network.py channel_policy.py migrate_network_slots.py; do
   [[ -f "${SCRIPT_DIR}/${file}" ]] || fail "安装包缺少 ${file}"
 done
 
@@ -21,6 +21,69 @@ modprobe tun 2>/dev/null || true
 [[ -c /dev/net/tun ]] || fail "未检测到 /dev/net/tun"
 
 install -d -o root -g root -m 0700 "${DATA_DIR}"
+existing_channels=0
+[[ ! -s "${CHANNEL_FILE}" ]] || existing_channels=1
+backup="/var/backups/aimilivpn/multi-install-42-$(date +%Y%m%d-%H%M%S)-$$"
+targets=(
+  "${APP_DIR}/channel_network.py" "${APP_DIR}/channel_policy.py" "${APP_DIR}/migrate_network_slots.py"
+  /usr/local/sbin/aimilivpn-multiexit /usr/local/sbin/xui-multi-provision
+  /etc/systemd/system/aimilivpn-multiexit.service
+  "${CHANNEL_FILE}" "${DATA_DIR}/state.json" "${DATA_DIR}/deep_failures.json" "${DATA_DIR}/verified_exits.json"
+  /etc/x-ui/multi-exit-result.json /etc/x-ui/x-ui.db /etc/x-ui/x-ui.db-wal /etc/x-ui/x-ui.db-shm
+)
+active_services=()
+for service in aimilivpn aimilivpn-multiexit x-ui; do
+  if systemctl is-active --quiet "$service"; then active_services+=("$service"); fi
+done
+was_enabled=0
+if systemctl is-enabled --quiet aimilivpn-multiexit; then was_enabled=1; fi
+restore_ready=0
+rollback_multi_install() {
+  local status="${1:-1}" index service active
+  trap - ERR INT TERM
+  set +e
+  systemctl stop aimilivpn aimilivpn-multiexit x-ui
+  if [[ "$was_enabled" == 0 ]]; then systemctl disable aimilivpn-multiexit; fi
+  if [[ "$restore_ready" == 1 ]]; then
+    for index in "${!targets[@]}"; do
+      if [[ -f "$backup/files/$index" ]]; then
+        cp -p -- "$backup/files/$index" "${targets[$index]}"
+      elif [[ -f "$backup/files/$index.absent" ]]; then
+        rm -f -- "${targets[$index]}"
+      fi
+    done
+  fi
+  systemctl daemon-reload
+  for service in x-ui aimilivpn-multiexit aimilivpn; do
+    for active in "${active_services[@]}"; do
+      [[ "$service" != "$active" ]] || systemctl start "$service"
+    done
+  done
+  printf '多国家安装未完成，已恢复本步骤备份并尝试重启原服务：%s\n' "$backup" >&2
+  printf '内部网络将在服务重连时重新配置；请检查 sudo journalctl -u aimilivpn-multiexit -n 60\n' >&2
+  exit "$status"
+}
+trap 'rollback_multi_install $?' ERR
+trap 'rollback_multi_install 130' INT TERM
+# The daemon may not be installed on a fresh host; only stop units that exist.
+for service in aimilivpn aimilivpn-multiexit x-ui; do
+  if [[ "$(systemctl show -p LoadState --value "$service")" != not-found ]]; then
+    systemctl stop "$service"
+  fi
+done
+install -d -m 0700 "$backup/files"
+printf '%s\n' "${targets[@]}" > "$backup/manifest.txt"
+for index in "${!targets[@]}"; do
+  if [[ -f "${targets[$index]}" ]]; then
+    cp -p -- "${targets[$index]}" "$backup/files/$index"
+  else
+    : > "$backup/files/$index.absent"
+  fi
+done
+restore_ready=1
+install -o root -g root -m 0644 "${SCRIPT_DIR}/channel_network.py" "${APP_DIR}/channel_network.py"
+install -o root -g root -m 0644 "${SCRIPT_DIR}/channel_policy.py" "${APP_DIR}/channel_policy.py"
+install -o root -g root -m 0755 "${SCRIPT_DIR}/migrate_network_slots.py" "${APP_DIR}/migrate_network_slots.py"
 install -o root -g root -m 0755 "${SCRIPT_DIR}/multi_exit_manager.py" /usr/local/sbin/aimilivpn-multiexit
 install -o root -g root -m 0755 "${SCRIPT_DIR}/xui_multi_provision.py" /usr/local/sbin/xui-multi-provision
 
@@ -100,14 +163,20 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
 
-systemctl stop x-ui
+if [[ "$existing_channels" == 1 ]]; then
+  python3 "${SCRIPT_DIR}/migrate_network_slots.py" --apply
+fi
 /usr/local/sbin/xui-multi-provision --channels "${CHANNEL_FILE}"
 systemctl daemon-reload
-systemctl enable --now aimilivpn-multiexit.service
+systemctl enable aimilivpn-multiexit.service
 systemctl restart x-ui
+systemctl restart aimilivpn-multiexit
+systemctl start aimilivpn
 sleep 5
-systemctl is-active --quiet x-ui || fail "3x-ui 启动失败，数据库备份位置记录在 /etc/x-ui/multi-exit-result.json"
-systemctl is-active --quiet aimilivpn-multiexit || fail "多国家出口服务启动失败"
+systemctl is-active --quiet x-ui
+systemctl is-active --quiet aimilivpn-multiexit
+systemctl is-active --quiet aimilivpn
+trap - ERR INT TERM
 
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
   python3 - "${CHANNEL_FILE}" <<'PY' | while read -r proto port; do

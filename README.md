@@ -19,6 +19,7 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/GaryTung/newinstall
 - VPS直连节点与多国家独立出口同时存在；
 - 每个国家可独立选择 VLESS、Trojan 或 Hysteria2；
 - 每个国家使用独立端口、网络命名空间、Open VPN和出口；
+- 每条线路持久使用独立内部网段，删除或新增其他线路不会改变现有转发地址；
 - 严格锁定国家，不会在目标国家失败时跳到其他国家；
 - 支持住宅优先、仅住宅、仅机房或全部IP；
 - 支持添加、删除、保存和手动切换单个国家线路；
@@ -81,9 +82,11 @@ sudo ml restart
 
 ## 升级
 
-重新执行一行安装命令。安装器会在替换程序前备份旧版本，并保留后台账号、节点数据、国家通道和3x-ui数据库。
+现有服务器执行下面命令升级。升级器会备份程序、通道配置、运行记录和3x-ui数据库，迁移旧版重复内部地址，并保留后台账号、节点端口及订阅凭据。迁移期间服务会短暂重启，随后各通道自动重连。
 
+```bash
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/GaryTung/newinstall/main/upgrade-dashboard.sh)"
+```
 
 ## 安全提示
 

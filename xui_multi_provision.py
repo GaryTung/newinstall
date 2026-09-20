@@ -10,9 +10,34 @@ import re
 import secrets
 import shutil
 import sqlite3
+import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, os.environ.get("VPNGATE_APP_DIR", "/opt/aimilivpn"))
+from channel_network import channel_network, channel_slot, ensure_network_slots
+
+
+def load_channel_config(path):
+    """Persist addresses before filtering disabled channels or applying one line."""
+    config = json.loads(Path(path).read_text(encoding="utf-8"))
+    if ensure_network_slots(config):
+        target = Path(path)
+        descriptor, temporary = tempfile.mkstemp(prefix=target.name + ".", dir=target.parent)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(config, stream, ensure_ascii=False, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, target)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    return config
 
 
 def default_xray_template():
@@ -56,11 +81,8 @@ def load_json(value, default):
         return default
 
 
-def channel_ip(index):
-    slot = index - 1
-    third = 200 + (slot // 60)
-    fourth = (slot % 60) * 4
-    return f"10.253.{third}.{fourth + 2}"
+def channel_ip(slot):
+    return channel_network(slot)[2]
 
 
 def new_client(protocol, existing=None, existing_protocol=None, display_name=None):
@@ -268,7 +290,7 @@ def main():
     if args.delete_channel_id:
         delete_channel(Path(args.database), Path(args.result), args.delete_channel_id)
         return
-    channel_config = load_json(Path(args.channels).read_text(encoding="utf-8"), {})
+    channel_config = load_channel_config(args.channels)
     channels = channel_config.get("channels", [])
     channels = [c for c in channels if c.get("enabled", True)]
     if not channels:
@@ -318,7 +340,7 @@ def main():
                         remove_normalized_client(db, row["id"])
                         db.execute("delete from inbounds where id=?", (row["id"],))
         columns = [r[1] for r in db.execute("pragma table_info(inbounds)")]
-        for index, channel in enumerate(channels, 1):
+        for channel in channels:
             cid = str(channel["id"]).lower()
             if args.direct_only:
                 continue
@@ -407,7 +429,8 @@ def main():
                 "id": cid, "name": channel.get("name", cid), "country": channel["country"],
                 "port": port, "protocol": protocol, "subId": client.get("subId"),
                 "inbound_tag": item["tag"], "outbound_tag": "VPNGATE-COUNTRY-" + cid.upper(),
-                "proxy_address": channel_ip(index), "inbound_tags": inbound_tags,
+                "proxy_address": channel_ip(channel_slot(channel)), "inbound_tags": inbound_tags,
+                "network_slot": channel_slot(channel),
                 "socks_enabled": bool(channel.get("socks_enabled")),
                 "socks_port": int(channel.get("socks_port") or 0), "socks_tag": socks_tag,
             })

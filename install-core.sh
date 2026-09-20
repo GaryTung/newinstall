@@ -22,7 +22,7 @@ if [[ "${EUID}" -ne 0 ]]; then
   fail "请使用 sudo bash install.sh 运行。"
 fi
 
-for file in vpngate_manager.py vpn_utils.py proxy_server.py; do
+for file in vpngate_manager.py vpn_utils.py proxy_server.py channel_network.py channel_policy.py; do
   [[ -f "${SCRIPT_DIR}/${file}" ]] || fail "安装包缺少 ${file}"
 done
 
@@ -63,13 +63,15 @@ trap 'rm -rf -- "${cache_dir}"' EXIT
 PYTHONPYCACHEPREFIX="${cache_dir}" python3 -m py_compile \
   "${SCRIPT_DIR}/vpngate_manager.py" \
   "${SCRIPT_DIR}/vpn_utils.py" \
-  "${SCRIPT_DIR}/proxy_server.py"
+  "${SCRIPT_DIR}/proxy_server.py" \
+  "${SCRIPT_DIR}/channel_network.py" \
+  "${SCRIPT_DIR}/channel_policy.py"
 
 backup_dir=""
 if [[ -f "${APP_DIR}/vpngate_manager.py" ]]; then
   backup_dir="/var/backups/aimilivpn/$(date +%Y%m%d-%H%M%S)"
   install -d -o root -g root -m 0700 "${backup_dir}"
-  for file in vpngate_manager.py vpn_utils.py proxy_server.py; do
+  for file in vpngate_manager.py vpn_utils.py proxy_server.py channel_network.py channel_policy.py; do
     [[ -f "${APP_DIR}/${file}" ]] && cp -p -- "${APP_DIR}/${file}" "${backup_dir}/${file}"
   done
 fi
@@ -79,6 +81,8 @@ install -d -o root -g root -m 0700 "${DATA_DIR}"
 install -o root -g root -m 0755 "${SCRIPT_DIR}/vpngate_manager.py" "${APP_DIR}/vpngate_manager.py"
 install -o root -g root -m 0755 "${SCRIPT_DIR}/vpn_utils.py" "${APP_DIR}/vpn_utils.py"
 install -o root -g root -m 0755 "${SCRIPT_DIR}/proxy_server.py" "${APP_DIR}/proxy_server.py"
+install -o root -g root -m 0644 "${SCRIPT_DIR}/channel_network.py" "${APP_DIR}/channel_network.py"
+install -o root -g root -m 0644 "${SCRIPT_DIR}/channel_policy.py" "${APP_DIR}/channel_policy.py"
 if [[ -f "${SCRIPT_DIR}/LICENSE" ]]; then
   install -o root -g root -m 0644 "${SCRIPT_DIR}/LICENSE" "${APP_DIR}/LICENSE"
 fi
@@ -143,7 +147,7 @@ if ! systemctl is-active --quiet "${APP_NAME}.service"; then
   journalctl -u "${APP_NAME}.service" -n 80 --no-pager >&2 || true
   if [[ -n "${backup_dir}" ]]; then
     printf '%s\n' '正在恢复升级前版本...' >&2
-    for file in vpngate_manager.py vpn_utils.py proxy_server.py; do
+    for file in vpngate_manager.py vpn_utils.py proxy_server.py channel_network.py channel_policy.py; do
       [[ -f "${backup_dir}/${file}" ]] && install -o root -g root -m 0755 "${backup_dir}/${file}" "${APP_DIR}/${file}"
     done
     systemctl restart "${APP_NAME}.service" || true
