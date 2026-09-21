@@ -19,6 +19,27 @@ spec.loader.exec_module(provision)
 
 
 class ProvisionNetworkTests(unittest.TestCase):
+    def test_chinese_country_names_get_unique_internal_client_emails(self):
+        channels = [
+            ("us", 7825, "美国-20260921", "hysteria"),
+            ("jp", 7866, "日本-20260921", "trojan"),
+            ("kr", 7888, "韩国-20260921", "vless"),
+        ]
+        emails = [
+            provision.new_client(protocol, display_name=name,
+                                 client_key=f"country-{channel_id}-{port}")["email"]
+            for channel_id, port, name, protocol in channels
+        ]
+        self.assertEqual(len(set(emails)), 3)
+        self.assertEqual(emails, [
+            "country-us-7825-20260921",
+            "country-jp-7866-20260921",
+            "country-kr-7888-20260921",
+        ])
+        with contextlib.closing(sqlite3.connect(":memory:")) as db:
+            db.execute("create table clients(email text unique)")
+            db.executemany("insert into clients(email) values(?)", [(email,) for email in emails])
+
     def test_disabled_deleted_and_reordered_channels_keep_stable_addresses(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "channels.json"

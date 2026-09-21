@@ -1,3 +1,9 @@
+# unique-client-email.45
+
+- Fix same-day fresh installs where Chinese country names normalized to the same date-only internal client email and triggered `UNIQUE constraint failed: clients.email`.
+- Internal emails now include the stable channel ID and port, for example `country-us-7825-20260921`; visible names, subscription names, ports, and existing credentials are unchanged.
+- Add a regression test covering the three default Chinese country lines created on the same day.
+
 # safe-no-speed.44
 
 - 移除出口下载测速、额外测速隧道、自动速度排名切换和页面测速入口；旧测速结果不再参与出口选择。

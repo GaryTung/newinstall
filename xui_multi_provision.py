@@ -85,12 +85,17 @@ def channel_ip(slot):
     return channel_network(slot)[2]
 
 
-def new_client(protocol, existing=None, existing_protocol=None, display_name=None):
+def new_client(protocol, existing=None, existing_protocol=None, display_name=None, client_key=None):
     if existing and existing_protocol == protocol:
         return dict(existing)
     now = int(time.time() * 1000)
     password = secrets.token_urlsafe(18)
-    generated_email = re.sub(r"[^A-Za-z0-9_.-]", "-", str(display_name or "")).strip("-.")[:48]
+    # 3x-ui v3 makes clients.email unique. Chinese country names are stripped by
+    # the ASCII-only normalizer, so three same-day names could collapse to the
+    # same date-only value. Prefix it with a stable ASCII channel identity.
+    email_key = re.sub(r"[^A-Za-z0-9_.-]", "-", str(client_key or "")).strip("-.")
+    email_name = re.sub(r"[^A-Za-z0-9_.-]", "-", str(display_name or "")).strip("-.")
+    generated_email = "-".join(part for part in (email_key, email_name) if part)[:48].rstrip("-.")
     client = {
         "email": generated_email or "country-" + secrets.token_hex(4), "enable": True,
         "expiryTime": 0, "limitIp": 0, "totalGB": 0,
@@ -371,7 +376,10 @@ def main():
             protocol = str(channel.get("protocol") or old_protocol or old_direct_protocol)
             if protocol not in ("vless", "trojan", "hysteria"):
                 raise RuntimeError(f"线路 {cid} 的协议无效")
-            client = new_client(protocol, old_client, old_protocol, channel.get("name"))
+            client = new_client(
+                protocol, old_client, old_protocol, channel.get("name"),
+                f"country-{cid}-{port}",
+            )
             item = dict(source)
             item.pop("id", None)
             item.update({
