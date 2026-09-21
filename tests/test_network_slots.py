@@ -88,6 +88,33 @@ class StableNetworkTests(unittest.TestCase):
             daemon.reconcile_interface_address([], 'vh-test', '10.253.200.13')
         self.assertEqual([c for c in calls if 'del' in c], [['ip', 'addr', 'del', '10.253.200.17/30', 'dev', 'vh-test']])
 
+    def test_v6_migration_releases_only_duplicate_same_country_pins(self):
+        daemon = load_daemon()
+        with tempfile.TemporaryDirectory() as directory:
+            daemon.CONFIG_FILE = Path(directory) / 'channels.json'
+            config = {
+                'version': 5,
+                'channels': [
+                    {'id': 'us-hy2', 'country': '美国', 'inbound_port': 7001, 'preferred_node_id': 'us-node'},
+                    {'id': 'us-vless', 'country': 'US', 'inbound_port': 7002, 'preferred_node_id': 'us-node'},
+                    {'id': 'us-trojan', 'country': 'United States', 'inbound_port': 7003, 'preferred_node_id': 'other-us-node'},
+                    {'id': 'jp-hy2', 'country': '日本', 'inbound_port': 7004, 'preferred_node_id': 'us-node'},
+                ],
+            }
+            daemon.write_json(daemon.CONFIG_FILE, config)
+            loaded = daemon.load_config()
+            pins = {item['id']: item.get('preferred_node_id') for item in loaded['channels']}
+            self.assertEqual(pins['us-hy2'], 'us-node')
+            self.assertEqual(pins['us-vless'], '')
+            self.assertEqual(pins['us-trojan'], 'other-us-node')
+            self.assertEqual(pins['jp-hy2'], 'us-node')
+            self.assertEqual(loaded['version'], 6)
+
+            loaded['channels'][1]['preferred_node_id'] = 'us-node'
+            daemon.write_json(daemon.CONFIG_FILE, loaded)
+            reloaded = daemon.load_config()
+            self.assertEqual(reloaded['channels'][1]['preferred_node_id'], 'us-node')
+
 
 if __name__ == '__main__':
     unittest.main()

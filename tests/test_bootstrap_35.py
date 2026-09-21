@@ -9,6 +9,20 @@ from pathlib import Path
 
 
 class BootstrapTests(unittest.TestCase):
+    def test_initial_detection_does_not_become_a_manual_pin(self):
+        source = (Path(__file__).resolve().parents[1] / 'vpngate_manager.py').read_text(encoding='utf-8')
+        tree = ast.parse(source)
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name == 'mark_channel_ready')
+        assignments = [node for node in ast.walk(function) if isinstance(node, ast.Assign)]
+        self.assertFalse(any(
+            any(isinstance(target, ast.Subscript)
+                and isinstance(target.value, ast.Name) and target.value.id == 'channel'
+                and isinstance(target.slice, ast.Constant) and target.slice.value == 'preferred_node_id'
+                for target in item.targets)
+            for item in assignments
+        ))
+
     def test_node_display_names_are_chinese_country_and_creation_date(self):
         source = (Path(__file__).resolve().parents[1] / 'vpngate_manager.py').read_text(encoding='utf-8')
         tree = ast.parse(source)

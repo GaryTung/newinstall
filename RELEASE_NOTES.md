@@ -1,3 +1,10 @@
+# distinct-country-exits.46
+
+- 同一国家建立多个协议或端口时，自动选择会优先避开该国家其他线路已经占用的 VPNGate 节点和出口 IP。
+- 不同可用 IP 数量不足或独立候选连接失败时，仍允许共用出口，避免为了强制去重导致线路离线。
+- 手动固定节点继续拥有最高优先级，因此用户明确选择同一节点时不会被自动规则覆盖。
+- 新线路首次检测到可用节点时只解除启动等待，不再把该节点误记为手动固定；升级时会一次性释放同国家重复指向同一节点的旧固定记录。
+
 # unique-client-email.45
 
 - Fix same-day fresh installs where Chinese country names normalized to the same date-only internal client email and triggered `UNIQUE constraint failed: clients.email`.

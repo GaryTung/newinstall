@@ -171,6 +171,11 @@ def default_config():
     }
 
 
+def country_identity(value):
+    country = str(value or "").strip()
+    return COUNTRY_CODES.get(country, country.casefold())
+
+
 def load_config():
     cfg = read_json(CONFIG_FILE, None)
     if not isinstance(cfg, dict):
@@ -192,7 +197,27 @@ def load_config():
         item["ip_type"] = str(item.get("ip_type") or "all").strip()
         channels.append(item)
     cfg["channels"] = channels
-    if ensure_network_slots(cfg):
+    changed = ensure_network_slots(cfg)
+    # Older releases stored the first automatically detected node as if it was
+    # a manual pin.  With several protocols for one country this commonly made
+    # every line stick to the same node forever.  On the one-time v6 migration,
+    # retain the first pin but release exact duplicate pins for sibling lines.
+    if int(cfg.get("version") or 0) < 6:
+        seen_country_pins = set()
+        for item in channels:
+            preferred = str(item.get("preferred_node_id") or "").strip()
+            if not preferred:
+                continue
+            country_key = country_identity(item.get("country"))
+            key = (country_key, preferred)
+            if key in seen_country_pins:
+                item["preferred_node_id"] = ""
+                changed = True
+            else:
+                seen_country_pins.add(key)
+        cfg["version"] = 6
+        changed = True
+    if changed:
         write_json(CONFIG_FILE, cfg)
     return cfg
 
@@ -395,8 +420,35 @@ def record_runtime_end(history, runtime, failed=False):
         record_node_failure(history, node_id)
 
 
-def select_candidates(channel, exclude=None, history=None, recovery=False):
+def node_known_exit_ip(node):
+    return str(node.get("exit_ip") or node.get("ip") or node.get("remote_host") or "").strip()
+
+
+def occupied_country_exits(channel, state, configured_channels):
+    """Return nodes/exits already reserved by sibling lines of this country."""
+    node_ids = set()
+    exit_ips = set()
+    runtimes = state.get("channels", {}) if isinstance(state, dict) else {}
+    for sibling in configured_channels if isinstance(configured_channels, list) else []:
+        if not sibling.get("enabled") or sibling.get("id") == channel.get("id"):
+            continue
+        if country_identity(sibling.get("country")) != country_identity(channel.get("country")):
+            continue
+        runtime = runtimes.get(sibling.get("id"), {})
+        node_id = str(runtime.get("node_id") or "").strip()
+        exit_ip = str(runtime.get("exit_ip") or "").strip()
+        if node_id:
+            node_ids.add(node_id)
+        if exit_ip:
+            exit_ips.add(exit_ip)
+    return node_ids, exit_ips
+
+
+def select_candidates(channel, exclude=None, history=None, recovery=False,
+                      occupied_node_ids=None, occupied_exit_ips=None):
     exclude = set(exclude or [])
+    occupied_node_ids = set(occupied_node_ids or [])
+    occupied_exit_ips = set(occupied_exit_ips or [])
     history = history if isinstance(history, dict) else {}
     nodes = read_json(NODES_FILE, [])
     selected = []
@@ -432,11 +484,15 @@ def select_candidates(channel, exclude=None, history=None, recovery=False):
         score = int(node.get("score") or 0)
         verified_at = float((verified_exits.get(nid) or {}).get("verified_at") or 0)
         verified_rank = 0 if now - verified_at <= FULL_EXIT_VERIFIED_TTL_SECONDS else 1
+        occupied_rank = 1 if (
+            nid in occupied_node_ids or node_known_exit_ip(node) in occupied_exit_ips
+        ) else 0
         selected.append((
             0 if nid == preferred else 1,
             rank,
-            verified_rank,
             status_rank,
+            occupied_rank,
+            verified_rank,
             -int(node_history.get("successful_connections") or 0),
             -int(node_history.get("total_uptime_seconds") or 0),
             -int(node_history.get("longest_uptime_seconds") or 0),
@@ -591,17 +647,23 @@ def stop_runtime(runtime):
     terminate_pid(runtime.get("proxy_pid"))
 
 
-def connect_channel(channel, index, previous, history):
+def connect_channel(channel, index, previous, history, occupied_node_ids=None, occupied_exit_ips=None):
     work = DATA_DIR / channel["id"]
     work.mkdir(parents=True, exist_ok=True)
     ns, ns_ip = ensure_namespace(channel, index)
     stop_namespace_processes(ns)
     failed = list(previous.get("recent_failures") or [])[-8:]
-    candidates = select_candidates(channel, history=history)
+    candidates = select_candidates(
+        channel, history=history,
+        occupied_node_ids=occupied_node_ids, occupied_exit_ips=occupied_exit_ips,
+    )
     if not candidates:
         # Do not leave an offline country waiting hours for historical backoff.
         # Live retries remain rate-limited by last_failure_at.
-        candidates = select_candidates(channel, history=history, recovery=True)
+        candidates = select_candidates(
+            channel, history=history, recovery=True,
+            occupied_node_ids=occupied_node_ids, occupied_exit_ips=occupied_exit_ips,
+        )
     if not candidates:
         pool = [n for n in read_json(NODES_FILE, []) if country_matches(n, channel['country'])]
         policy = [n for n in pool if not channel_provider_rejection(channel, node=n) and ip_type_rank(n, channel.get('ip_type', 'all')) < 99]
@@ -839,7 +901,14 @@ def daemon():
                 runtime.update({"status": "connecting", "error": "", "exit_ip": "", "exit_country_code": "", "node_id": "", "openvpn_pid": 0, "proxy_pid": 0, "checked_at": time.time()})
                 write_json(STATE_FILE, state)
                 try:
-                    state["channels"][channel["id"]] = connect_channel(channel, index, previous, history)
+                    occupied_node_ids, occupied_exit_ips = occupied_country_exits(
+                        channel, state, cfg["channels"],
+                    )
+                    state["channels"][channel["id"]] = connect_channel(
+                        channel, index, previous, history,
+                        occupied_node_ids=occupied_node_ids,
+                        occupied_exit_ips=occupied_exit_ips,
+                    )
                     state["channels"][channel["id"]]["config_signature"] = signature
                     state["channels"][channel["id"]]["consecutive_health_failures"] = 0
                 except Exception as exc:

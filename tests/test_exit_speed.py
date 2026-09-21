@@ -22,11 +22,11 @@ class StableSelectionTests(unittest.TestCase):
                        "probe_status": "available", "latency_ms": latency}
                       for key, ip, latency in [("stable", "8.8.8.1", 100), ("fast", "8.8.8.2", 10)]]
 
-    def selected(self, channel=None, history=None):
+    def selected(self, channel=None, history=None, **kwargs):
         with patch.object(manager, "read_json", return_value=self.nodes) as read, \
              patch.object(manager, "deep_failure_records", return_value={}), \
              patch.object(manager, "verified_exit_records", return_value={}):
-            result = manager.select_candidates(channel or self.channel, history=history)
+            result = manager.select_candidates(channel or self.channel, history=history, **kwargs)
             read.assert_called_once_with(manager.NODES_FILE, [])
             return result
 
@@ -38,6 +38,41 @@ class StableSelectionTests(unittest.TestCase):
         selected = self.selected({**self.channel, "preferred_node_id": "fast"},
                                  {"stable": {"successful_connections": 4}})
         self.assertEqual("fast", selected[0]["id"])
+
+    def test_same_country_automatic_lines_prefer_an_unused_exit(self):
+        selected = self.selected(
+            history={"stable": {"successful_connections": 4, "total_uptime_seconds": 3600}},
+            occupied_node_ids={"stable"}, occupied_exit_ips={"8.8.8.1"},
+        )
+        self.assertEqual(["fast", "stable"], [node["id"] for node in selected])
+
+    def test_manual_pin_can_intentionally_reuse_an_occupied_exit(self):
+        selected = self.selected(
+            {**self.channel, "preferred_node_id": "stable"},
+            occupied_node_ids={"stable"}, occupied_exit_ips={"8.8.8.1"},
+        )
+        self.assertEqual("stable", selected[0]["id"])
+
+    def test_occupied_exit_remains_a_fallback_when_capacity_is_insufficient(self):
+        self.nodes = [self.nodes[0]]
+        selected = self.selected(occupied_node_ids={"stable"}, occupied_exit_ips={"8.8.8.1"})
+        self.assertEqual(["stable"], [node["id"] for node in selected])
+
+    def test_only_sibling_lines_in_the_same_country_reserve_exits(self):
+        channel = {**self.channel, "id": "us-vless"}
+        state = {"channels": {
+            "us-hy2": {"node_id": "stable", "exit_ip": "8.8.8.1", "status": "connected"},
+            "jp-hy2": {"node_id": "jp-node", "exit_ip": "9.9.9.9", "status": "connected"},
+        }}
+        configured = [
+            {"id": "us-hy2", "country": "US", "enabled": True},
+            {"id": "us-vless", "country": "美国", "enabled": True},
+            {"id": "jp-hy2", "country": "日本", "enabled": True},
+        ]
+        self.assertEqual(
+            ({"stable"}, {"8.8.8.1"}),
+            manager.occupied_country_exits(channel, state, configured),
+        )
 
     def test_stale_benchmark_config_never_changes_order_or_signature(self):
         legacy = {**self.channel, "speed_auto": True, "speed_request_token": 99999999999}

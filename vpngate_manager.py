@@ -890,8 +890,9 @@ def mark_channel_ready(channel_id: str, preferred_node_id: str = "") -> None:
             return
         channel["awaiting_initial_test"] = False
         channel["tested_only"] = True
-        if preferred_node_id:
-            channel["preferred_node_id"] = preferred_node_id
+        # The first usable result releases startup only.  It is not a manual
+        # pin: sibling protocols for this country must remain free to choose
+        # different exits.  Explicit UI selection still writes preferred_node_id.
         channel["initial_test_completed_at"] = time.time()
         channel["restart_token"] = time.time()
         config["channels"][index] = channel

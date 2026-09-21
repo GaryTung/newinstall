@@ -5,7 +5,7 @@ umask 077
 app=/opt/aimilivpn
 [[ -f "$app/vpngate_manager.py" ]] || { echo '未检测到已安装后台'; exit 1; }
 work=$(mktemp -d /tmp/gateway-dashboard.XXXXXX)
-backup="/var/backups/aimilivpn/dashboard-44-$(date +%Y%m%d-%H%M%S)-$$"
+backup="/var/backups/aimilivpn/dashboard-46-$(date +%Y%m%d-%H%M%S)-$$"
 cleanup() {
   [[ "$work" == /tmp/gateway-dashboard.* && -d "$work" ]] && rm -rf -- "$work"
 }

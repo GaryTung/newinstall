@@ -23,7 +23,7 @@ modprobe tun 2>/dev/null || true
 install -d -o root -g root -m 0700 "${DATA_DIR}"
 existing_channels=0
 [[ ! -s "${CHANNEL_FILE}" ]] || existing_channels=1
-backup="/var/backups/aimilivpn/multi-install-44-$(date +%Y%m%d-%H%M%S)-$$"
+backup="/var/backups/aimilivpn/multi-install-46-$(date +%Y%m%d-%H%M%S)-$$"
 targets=(
   "${APP_DIR}/channel_network.py" "${APP_DIR}/channel_policy.py" "${APP_DIR}/migrate_network_slots.py"
   "${APP_DIR}/resource_guard.py"

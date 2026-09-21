@@ -18,6 +18,7 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/GaryTung/newinstall
 
 - VPS直连节点与多国家独立出口同时存在；
 - 每个国家可独立选择 VLESS、Trojan 或 Hysteria2；
+- 同一国家可建立多个协议或端口；自动连接优先为这些线路分配不同的可用出口 IP，不足时才共用；
 - 每个国家使用独立端口、网络命名空间、Open VPN和出口；
 - 每条线路持久使用独立内部网段，删除或新增其他线路不会改变现有转发地址；
 - 严格锁定国家，不会在目标国家失败时跳到其他国家；
