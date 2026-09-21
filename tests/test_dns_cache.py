@@ -212,6 +212,14 @@ class DNSCacheTests(unittest.TestCase):
             self.assertEqual(proxy.resolve_dns_over_tun0("2001:db8::1"), "2001:db8::1")
             query.assert_not_called()
 
+    def test_zero_cache_size_bypasses_cache_and_fingerprint(self):
+        with patch.object(proxy, "DNS_CACHE_MAX_ENTRIES", 0), \
+             patch.object(proxy, "_dns_cache_scope", side_effect=AssertionError("cache fingerprint used")), \
+             patch.object(proxy, "_query_dns_over_tun0", return_value=("192.0.2.1", 300)) as query:
+            self.assertEqual(proxy.resolve_dns_over_tun0("example.org"), "192.0.2.1")
+            self.assertEqual(proxy.resolve_dns_over_tun0("example.org"), "192.0.2.1")
+            self.assertEqual(query.call_count, 2)
+
     def test_simultaneous_requests_share_one_wire_query(self):
         started = threading.Event()
         release = threading.Event()

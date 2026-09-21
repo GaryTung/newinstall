@@ -17,10 +17,16 @@ def parse_positive_int(value: str | None, default: int) -> int:
     except (TypeError, ValueError):
         return default
 
+def parse_non_negative_int(value: str | None, default: int) -> int:
+    try:
+        return max(0, int(value if value is not None else default))
+    except (TypeError, ValueError):
+        return default
+
 MAX_PROXY_CONNECTIONS = parse_positive_int(os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS"), 256)
 proxy_connection_sem = threading.BoundedSemaphore(MAX_PROXY_CONNECTIONS)
 
-DNS_CACHE_MAX_ENTRIES = min(8192, parse_positive_int(os.environ.get("LOCAL_PROXY_DNS_CACHE_SIZE"), 1024))
+DNS_CACHE_MAX_ENTRIES = min(8192, parse_non_negative_int(os.environ.get("LOCAL_PROXY_DNS_CACHE_SIZE"), 1024))
 DNS_CACHE_MAX_TTL = min(3600, parse_positive_int(os.environ.get("LOCAL_PROXY_DNS_CACHE_TTL"), 300))
 
 
@@ -334,6 +340,9 @@ def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) 
         host = _dns_host_key(host)
     except (UnicodeError, ValueError):
         return None
+    if DNS_CACHE_MAX_ENTRIES == 0:
+        answer = _query_dns_over_tun0(host, qtype, dns_server, timeout)
+        return answer[0] if answer is not None else None
     scope = _dns_cache_scope()
     if scope is None:
         _dns_cache.clear()
@@ -370,6 +379,8 @@ def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float
         key = _dns_host_key(host)
     except (UnicodeError, ValueError):
         return None
+    if DNS_CACHE_MAX_ENTRIES == 0:
+        return dns_query_over_tun0(host, 1, dns_server, timeout) or dns_query_over_tun0(host, 28, dns_server, timeout)
     scope = _dns_cache_scope()
     if scope is not None:
         # An AAAA cache hit must not repeat an earlier unsuccessful A request.

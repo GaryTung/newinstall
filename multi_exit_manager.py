@@ -517,7 +517,12 @@ def start_proxy(ns, work_dir):
     code = "import proxy_server; proxy_server.start_proxy_server('0.0.0.0',1080)"
     env = os.environ.copy()
     env.update({"PYTHONPATH": str(APP_DIR), "LOCAL_PROXY_HOST": "0.0.0.0", "LOCAL_PROXY_PORT": str(PROXY_PORT)})
-    return subprocess.Popen(["ip", "netns", "exec", ns, "env", *[f"{k}={v}" for k, v in env.items() if k in {"PYTHONPATH", "LOCAL_PROXY_HOST", "LOCAL_PROXY_PORT"}], "python3", "-c", code], stdout=log, stderr=subprocess.STDOUT)
+    allowed_env = {
+        "PYTHONPATH", "LOCAL_PROXY_HOST", "LOCAL_PROXY_PORT",
+        "LOCAL_PROXY_DNS_CACHE_SIZE", "LOCAL_PROXY_DNS_CACHE_TTL",
+        "LOCAL_PROXY_MAX_CONNECTIONS",
+    }
+    return subprocess.Popen(["ip", "netns", "exec", ns, "env", *[f"{k}={v}" for k, v in env.items() if k in allowed_env], "python3", "-c", code], stdout=log, stderr=subprocess.STDOUT)
 
 
 def start_openvpn(ns, work_dir, node):

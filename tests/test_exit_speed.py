@@ -84,6 +84,12 @@ class StableSelectionTests(unittest.TestCase):
         for marker in ("exit_speed", "speed_loop", "speed_results.json", "choose_switch", "speed_target"):
             self.assertNotIn(marker, source)
 
+    def test_proxy_process_accepts_server_specific_low_memory_settings(self):
+        source = (ROOT / "multi_exit_manager.py").read_text(encoding="utf-8")
+        self.assertIn('"LOCAL_PROXY_DNS_CACHE_SIZE"', source)
+        self.assertIn('"LOCAL_PROXY_DNS_CACHE_TTL"', source)
+        self.assertIn('"LOCAL_PROXY_MAX_CONNECTIONS"', source)
+
     def test_healthy_daemon_does_not_parse_catalog_or_choose_another_node(self):
         class EndPass(Exception):
             pass
