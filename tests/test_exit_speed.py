@@ -90,6 +90,31 @@ class StableSelectionTests(unittest.TestCase):
         self.assertIn('"LOCAL_PROXY_DNS_CACHE_TTL"', source)
         self.assertIn('"LOCAL_PROXY_MAX_CONNECTIONS"', source)
 
+    def test_history_compaction_is_country_scoped_bounded_and_preserves_active_nodes(self):
+        history = {
+            "US_old": {"last_success_at": 1},
+            "JP_recent": {"last_success_at": 30},
+            "JP_old": {"last_success_at": 2},
+            "KR_protected": {"last_success_at": 0},
+        }
+        compacted = manager.compact_history_map(
+            history, "JP", protected={"KR_protected"}, limit=2,
+        )
+        self.assertEqual(["KR_protected", "JP_recent"], list(compacted))
+
+    def test_expired_deep_failures_are_pruned_and_records_are_bounded(self):
+        records = {
+            "expired": {"failed_at": 1, "blocked_until": 2},
+            "active": {"failed_at": 90, "blocked_until": 200},
+            "recent": {"failed_at": 95, "blocked_until": 96},
+        }
+        with patch.object(manager, "DEEP_FAILURE_RETENTION_SECONDS", 20), \
+             patch.object(manager, "DEEP_FAILURE_MAX_ENTRIES", 2):
+            self.assertEqual(
+                ["active", "recent"],
+                list(manager.bounded_failure_records(records, now=100)),
+            )
+
     def test_healthy_daemon_does_not_parse_catalog_or_choose_another_node(self):
         class EndPass(Exception):
             pass
@@ -109,12 +134,13 @@ class StableSelectionTests(unittest.TestCase):
              patch.object(manager, "process_alive", return_value=True), \
              patch.object(manager, "proxy_health", return_value=(True, "8.8.8.1", 12)), \
              patch.object(manager, "clear_deep_failure"), patch.object(manager, "mark_exit_verified"), \
-             patch.object(manager, "write_json"), patch.object(manager, "signal", SimpleNamespace(SIGUSR1=10, signal=Mock())), \
+             patch.object(manager, "write_json") as write, patch.object(manager, "signal", SimpleNamespace(SIGUSR1=10, signal=Mock())), \
              patch.object(manager, "WAKE_EVENT", SimpleNamespace(wait=Mock(side_effect=EndPass))), \
              patch.object(manager, "select_candidates", side_effect=AssertionError("unexpected full catalog selection")), \
              patch.object(manager, "connect_channel", side_effect=AssertionError("unexpected tunnel switch")):
             with self.assertRaises(EndPass):
                 manager.daemon()
+            self.assertEqual(1, write.call_count)
 
 
 if __name__ == "__main__":

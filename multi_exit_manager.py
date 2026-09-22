@@ -52,6 +52,10 @@ RECOVERY_COOLDOWN_RETRY_SECONDS = int(os.environ.get("MULTI_EXIT_RECOVERY_RETRY_
 FULL_EXIT_VERIFIED_TTL_SECONDS = int(os.environ.get("MULTI_EXIT_VERIFIED_TTL_SECONDS", "1200"))
 MAX_CONNECT_CANDIDATES = int(os.environ.get("MULTI_EXIT_MAX_CONNECT_CANDIDATES", "8"))
 FAILURE_BACKOFF_SECONDS = (10 * 60, 30 * 60, 2 * 3600, 6 * 3600)
+CHANNEL_HISTORY_MAX_ENTRIES = 256
+LEGACY_HISTORY_MAX_ENTRIES = 512
+DEEP_FAILURE_MAX_ENTRIES = 512
+DEEP_FAILURE_RETENTION_SECONDS = 7 * 24 * 3600
 HEALTH_ENDPOINTS = (
     "https://api.ipify.org",
     "https://ipv4.icanhazip.com",
@@ -100,6 +104,21 @@ def deep_failure_records():
     return value if isinstance(value, dict) else {}
 
 
+def bounded_failure_records(records, now=None):
+    """Drop expired failure history and cap disk growth on small gateways."""
+    now = time.time() if now is None else float(now)
+    active = []
+    for key, value in records.items() if isinstance(records, dict) else []:
+        if not isinstance(value, dict):
+            continue
+        failed_at = float(value.get("failed_at") or 0)
+        blocked_until = float(value.get("blocked_until") or 0)
+        if blocked_until > now or failed_at >= now - DEEP_FAILURE_RETENTION_SECONDS:
+            active.append((max(failed_at, blocked_until), str(key), value))
+    active.sort(reverse=True)
+    return {key: value for _stamp, key, value in active[:DEEP_FAILURE_MAX_ENTRIES]}
+
+
 def verified_exit_records():
     value = read_json(VERIFIED_EXITS_FILE, {})
     return value if isinstance(value, dict) else {}
@@ -133,7 +152,7 @@ def mark_deep_failure(node_id, error, channel_id=""):
     node_id = str(node_id or "")
     if not node_id:
         return
-    records = deep_failure_records()
+    records = bounded_failure_records(deep_failure_records())
     key = f"{channel_id}:{node_id}" if channel_id else node_id
     previous = dict(records.get(key) or {})
     failures = int(previous.get("failures") or 0) + 1
@@ -174,6 +193,48 @@ def default_config():
 def country_identity(value):
     country = str(value or "").strip()
     return COUNTRY_CODES.get(country, country.casefold())
+
+
+def compact_history_map(history, country_code="", protected=None, limit=CHANNEL_HISTORY_MAX_ENTRIES):
+    """Retain only relevant/recent node history instead of cloning every country."""
+    country_code = str(country_code or "").upper()
+    protected = {str(value) for value in (protected or []) if value}
+    ranked = []
+    for node_id, record in history.items() if isinstance(history, dict) else []:
+        node_id = str(node_id or "")
+        if not node_id or not isinstance(record, dict):
+            continue
+        if country_code and node_id not in protected and not node_id.upper().startswith(country_code + "_"):
+            continue
+        activity = max(
+            float(record.get("last_success_at") or 0),
+            float(record.get("last_failure_at") or 0),
+            float(record.get("last_connected_at") or 0),
+            float(record.get("last_disconnected_at") or 0),
+        )
+        ranked.append((node_id in protected, activity, int(record.get("successful_connections") or 0), node_id, record))
+    ranked.sort(reverse=True)
+    return {node_id: record for _protected, _activity, _successes, node_id, record in ranked[:max(1, int(limit))]}
+
+
+def compact_state_histories(state, configured_channels):
+    state["node_history"] = compact_history_map(
+        state.get("node_history", {}), limit=LEGACY_HISTORY_MAX_ENTRIES,
+    )
+    runtimes = state.get("channels", {}) if isinstance(state.get("channels"), dict) else {}
+    histories = state.get("channel_node_history", {})
+    if not isinstance(histories, dict):
+        histories = {}
+    configured = {str(channel.get("id") or ""): channel for channel in configured_channels}
+    compacted = {}
+    for channel_id, history in histories.items():
+        channel = configured.get(str(channel_id), {})
+        code = COUNTRY_CODES.get(str(channel.get("country") or "").strip(), "")
+        runtime = runtimes.get(channel_id, {}) if isinstance(runtimes, dict) else {}
+        protected = [runtime.get("node_id"), *(runtime.get("recent_failures") or [])]
+        compacted[channel_id] = compact_history_map(history, code, protected)
+    state["channel_node_history"] = compacted
+    return state
 
 
 def load_config():
@@ -750,6 +811,8 @@ def daemon():
     first_pass = True
     while True:
         cfg = load_config()
+        if first_pass:
+            compact_state_histories(state, cfg["channels"])
         desired = {c["id"]: c for c in cfg["channels"] if c.get("enabled")}
         for cid, runtime in list(state.get("channels", {}).items()):
             if cid not in desired:
@@ -787,7 +850,10 @@ def daemon():
             if not channel.get("enabled"):
                 continue
             if channel["id"] not in channel_histories:
-                channel_histories[channel["id"]] = json.loads(json.dumps(legacy_history))
+                code = COUNTRY_CODES.get(str(channel.get("country") or "").strip(), "")
+                channel_histories[channel["id"]] = compact_history_map(
+                    json.loads(json.dumps(legacy_history)), code,
+                )
             history = channel_histories[channel["id"]]
             runtime = state.setdefault("channels", {}).get(channel["id"], {})
             if channel.get("awaiting_initial_test"):
@@ -925,7 +991,7 @@ def daemon():
                         "node_id": "", "openvpn_pid": 0, "proxy_pid": 0, "checked_at": time.time(),
                     })
                     state["channels"][channel["id"]] = runtime
-            write_json(STATE_FILE, state)
+        write_json(STATE_FILE, state)
         first_pass = False
         WAKE_EVENT.wait(CHECK_SECONDS if all(x.get("status") == "connected" for x in state.get("channels", {}).values()) else RETRY_SECONDS)
         WAKE_EVENT.clear()
