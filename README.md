@@ -57,9 +57,10 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/GaryTung/newinstall
 
 ## 默认国家线路
 
-- `7825`：美国，Hysteria2，住宅优先；
-- `7866`：日本，Trojan，全部IP（排除 KDDI/AS2516）；
-- `7888`：韩国，VLESS，全部IP（排除 KT/AS4766）。
+- `7866/UDP`：日本，Hysteria2，全部IP（排除 KDDI/AS2516）；
+- `7888/UDP`：韩国，Hysteria2，全部IP（排除 KT/AS4766）。
+
+全新安装只创建日本、韩国两条默认国家出口，以减少一核低内存 VPS 的常驻隧道数量。升级已有服务器时保留现有国家、端口、协议和订阅，不会强制改成默认配置。
 
 后台可以修改或删除默认线路，也可以从节点国家清单新增其他国家。
 

@@ -265,7 +265,7 @@ if ! systemctl is-active --quiet x-ui; then
   fail "新入站启动失败，3x-ui 数据库已自动恢复"
 fi
 
-printf '%s\n' '[5/6] 安装多国家独立出口（默认 7825 美国、7866 日本、7888 韩国）...'
+printf '%s\n' '[5/6] 安装多国家独立出口（默认 7866 日本 HY2、7888 韩国 HY2）...'
 bash "${SCRIPT_DIR}/install-multi-exit.sh"
 
 printf '%s\n' '[6/6] 设置防火墙并输出结果...'

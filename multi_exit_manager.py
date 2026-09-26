@@ -181,11 +181,11 @@ def clear_deep_failure(node_id, channel_id=""):
 
 def default_config():
     return {
-        "version": 1,
+        "version": 6,
+        "direct_protocol": "hysteria",
         "channels": [
-            {"id": "us", "name": "美国线路", "inbound_port": 7825, "country": "美国", "ip_type": "residential_preferred", "enabled": True, "tested_only": True, "awaiting_initial_test": True},
-            {"id": "jp", "name": "日本线路", "inbound_port": 7866, "country": "日本", "ip_type": "all", "enabled": True, "tested_only": True, "awaiting_initial_test": True},
-            {"id": "kr", "name": "韩国线路", "inbound_port": 7888, "country": "韩国", "ip_type": "all", "enabled": True, "tested_only": True, "awaiting_initial_test": True},
+            {"id": "jp", "name": "日本线路", "inbound_port": 7866, "country": "日本", "protocol": "hysteria", "ip_type": "all", "enabled": True, "tested_only": True, "awaiting_initial_test": True, "standby_hot_target": 3, "standby_normal_target": 2},
+            {"id": "kr", "name": "韩国线路", "inbound_port": 7888, "country": "韩国", "protocol": "hysteria", "ip_type": "all", "enabled": True, "tested_only": True, "awaiting_initial_test": True, "standby_hot_target": 3, "standby_normal_target": 2},
         ],
     }
 
