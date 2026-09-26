@@ -6040,6 +6040,15 @@ function openAddChannelModal(){
   const error=$("new_channel_error");error.style.display='none';error.textContent='';renderAddChannelCountries();$("add_channel_modal").style.display='flex';
 }
 function closeAddChannelModal(){if($("add_channel_modal"))$("add_channel_modal").style.display='none';}
+async function confirmCreatedChannel(id,port){
+  for(let attempt=0;attempt<5;attempt++){
+    if(attempt)await new Promise(resolve=>setTimeout(resolve,500));
+    try{await loadMultiExit();}catch(e){}
+    const created=(multiExitData.config.channels||[]).find(c=>c.id===id||Number(c.inbound_port||0)===port);
+    if(created)return created;
+  }
+  return null;
+}
 async function createMultiExitChannel(){
   const country=$("new_channel_country").value;const port=parseInt($("new_channel_port").value);const protocol=$("new_channel_protocol").value;const ipType=$("new_channel_ip_type").value;
   const error=$("new_channel_error");const button=$("new_channel_create");
@@ -6049,8 +6058,17 @@ async function createMultiExitChannel(){
   const id=('line'+Date.now().toString(36)).slice(0,12);button.disabled=true;button.textContent='正在创建...';error.style.display='none';
   try{
     const r=await fetch('./api/update_multi_exit_channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,name:country+'线路',country,inbound_port:port,protocol,ip_type:ipType})});
-    const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'创建失败');closeAddChannelModal();$("multi_exit_message").textContent=d.message;await loadMultiExit();
-  }catch(e){error.textContent=e.message;error.style.display='block';}
+    const responseText=await r.text();let d=null;
+    if(responseText.trim()){try{d=JSON.parse(responseText);}catch(parseError){}}
+    if(r.ok&&d&&d.ok){closeAddChannelModal();$("multi_exit_message").textContent=d.message;await loadMultiExit();return;}
+    const created=r.ok?await confirmCreatedChannel(id,port):null;
+    if(created){closeAddChannelModal();$("multi_exit_message").textContent=`${country}线路已创建，后台正在检测并连接候选节点`;return;}
+    throw new Error((d&&d.error)||(responseText.trim()?`服务器返回了无法识别的响应（HTTP ${r.status}）`:`服务器未返回创建结果（HTTP ${r.status}）`));
+  }catch(e){
+    const created=await confirmCreatedChannel(id,port);
+    if(created){closeAddChannelModal();$("multi_exit_message").textContent=`${country}线路已创建，后台正在检测并连接候选节点`;}
+    else{error.textContent=e.message||'创建失败，请稍后重试';error.style.display='block';}
+  }
   finally{button.disabled=false;button.textContent='创建国家出口';}
 }
 function removeMultiExitRow(i){multiExitData.config.channels.splice(i,1);renderMultiExit();}
@@ -7882,6 +7900,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+        self.wfile.flush()
 
     def send_json(self, data: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
         self.send_bytes(json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8", status)
