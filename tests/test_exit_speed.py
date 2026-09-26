@@ -88,6 +88,7 @@ class StableSelectionTests(unittest.TestCase):
         source = (ROOT / "multi_exit_manager.py").read_text(encoding="utf-8")
         self.assertIn('"LOCAL_PROXY_DNS_CACHE_SIZE"', source)
         self.assertIn('"LOCAL_PROXY_DNS_CACHE_TTL"', source)
+        self.assertIn('"LOCAL_PROXY_DNS_SERVERS"', source)
         self.assertIn('"LOCAL_PROXY_MAX_CONNECTIONS"', source)
         self.assertIn('proxy.log.2', source)
         self.assertIn('1024 * 1024', source)
