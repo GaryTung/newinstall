@@ -7,6 +7,7 @@ DATA_DIR="/var/lib/${APP_NAME}"
 ENV_FILE="/etc/default/${APP_NAME}"
 SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/apt-wait.sh"
 
 UI_PORT="${UI_PORT:-8787}"
 PROXY_PORT="${PROXY_PORT:-7928}"
@@ -73,8 +74,8 @@ esac
 
 printf '%s\n' '[1/7] 安装系统依赖...'
 export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y --no-install-recommends \
+apt_get_wait update
+apt_get_wait install -y --no-install-recommends \
   ca-certificates curl iproute2 iptables openvpn procps python3
 
 printf '%s\n' '[2/7] 检查 TUN 设备...'

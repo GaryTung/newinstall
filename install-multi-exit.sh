@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/apt-wait.sh"
 APP_DIR="/opt/aimilivpn"
 DATA_DIR="/var/lib/aimilivpn-multiexit"
 CHANNEL_FILE="${DATA_DIR}/channels.json"
@@ -15,8 +16,8 @@ for file in multi_exit_manager.py xui_multi_provision.py channel_network.py chan
   [[ -f "${SCRIPT_DIR}/${file}" ]] || fail "安装包缺少 ${file}"
 done
 
-apt-get update
-apt-get install -y --no-install-recommends iproute2 iptables curl openvpn python3
+apt_get_wait update
+apt_get_wait install -y --no-install-recommends iproute2 iptables curl openvpn python3
 modprobe tun 2>/dev/null || true
 [[ -c /dev/net/tun ]] || fail "未检测到 /dev/net/tun"
 

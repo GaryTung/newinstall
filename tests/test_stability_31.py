@@ -19,6 +19,7 @@ class Stability31PackageTests(unittest.TestCase):
             "install-core.sh",
             "unified-install.sh",
             "install-multi-exit.sh",
+            "apt-wait.sh",
             "vpngate_manager.py",
             "vpn_utils.py",
             "proxy_server.py",

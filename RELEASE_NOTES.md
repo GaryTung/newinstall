@@ -1,3 +1,9 @@
+# apt-lock-wait.52
+
+- Google Cloud、Oracle Cloud 等新建 Ubuntu 24.04 实例仍在运行首次自动更新时，安装器不再因 APT/DPKG 锁立即退出。
+- 所有安装阶段统一等待锁释放，默认最长 15 分钟；等待时显示占用进程和进度，不删除锁文件、不强制终止系统更新。
+- 非锁相关的 APT 错误仍立即失败并保留原始错误输出，避免掩盖镜像源、网络或软件包问题。
+
 # create-response-recovery.51
 
 - 修复“添加国家出口”已经创建成功，但浏览器偶发收到空响应并显示 `Unexpected end of JSON input` 的误报。

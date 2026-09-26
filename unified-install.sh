@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/apt-wait.sh"
 XUI_INSTALL_URL="https://raw.githubusercontent.com/MHSanaei/3x-ui/main/install.sh"
 OPEN_ALL_PORTS="${OPEN_ALL_PORTS:-1}"
 
@@ -23,7 +24,7 @@ open_all_host_ports() {
     "${firewall_cmd}" -P OUTPUT ACCEPT
     "${firewall_cmd}" -F
   done
-  DEBIAN_FRONTEND=noninteractive apt-get purge -y netfilter-persistent iptables-persistent >/dev/null 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt_get_wait purge -y netfilter-persistent iptables-persistent >/dev/null 2>&1 || true
   printf '%s\n' 'Ubuntu 本机防火墙已开放；Oracle Cloud 的 VCN/NSG 仍需在控制台单独放行。'
 }
 
@@ -139,8 +140,8 @@ read -rp '证书方式：输入域名，直接回车则申请公网 IP 证书: '
 read -rp 'Let’s Encrypt 邮箱（可留空）: ' acme_email
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl openssl python3 cron socat iptables
+apt_get_wait update
+apt_get_wait install -y --no-install-recommends ca-certificates curl openssl python3 cron socat iptables
 
 if [[ "${OPEN_ALL_PORTS}" == "1" ]]; then
   open_all_host_ports
