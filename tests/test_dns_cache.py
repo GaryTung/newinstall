@@ -204,7 +204,23 @@ class DNSCacheTests(unittest.TestCase):
         with patch.object(proxy, "_query_dns_over_tun0", side_effect=query) as query_mock:
             self.assertEqual(proxy.resolve_dns_over_tun0("example.org"), "2001:db8::1")
             self.assertEqual(proxy.resolve_dns_over_tun0("example.org"), "2001:db8::1")
+            self.assertEqual(query_mock.call_count, 4)
+
+    def test_default_resolvers_fall_back_before_giving_up(self):
+        def query(host, qtype, server, timeout):
+            if qtype == 1 and server == "8.8.8.8":
+                return "192.0.2.8", 60
+            return None
+        with patch.object(proxy, "DNS_SERVERS", ("1.1.1.1", "8.8.8.8", "9.9.9.9")), \
+             patch.object(proxy, "_query_dns_over_tun0", side_effect=query) as query_mock:
+            self.assertEqual(proxy.resolve_dns_over_tun0("fallback.example"), "192.0.2.8")
             self.assertEqual(query_mock.call_count, 2)
+
+    def test_dns_server_configuration_is_validated_deduplicated_and_bounded(self):
+        self.assertEqual(
+            proxy.parse_dns_servers("bad,1.1.1.1,1.1.1.1,8.8.8.8,9.9.9.9,208.67.222.222,4.4.4.4"),
+            ("1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222"),
+        )
 
     def test_literal_ips_need_no_dns(self):
         with patch.object(proxy, "_query_dns_over_tun0") as query:

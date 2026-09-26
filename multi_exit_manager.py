@@ -574,7 +574,15 @@ def channel_signature(channel):
 
 
 def start_proxy(ns, work_dir):
-    log = open(work_dir / "proxy.log", "ab", buffering=0)
+    log_path = work_dir / "proxy.log"
+    if log_path.exists() and log_path.stat().st_size > 1024 * 1024:
+        oldest = work_dir / "proxy.log.2"
+        previous = work_dir / "proxy.log.1"
+        oldest.unlink(missing_ok=True)
+        if previous.exists():
+            previous.replace(oldest)
+        log_path.replace(previous)
+    log = open(log_path, "ab", buffering=0)
     code = "import proxy_server; proxy_server.start_proxy_server('0.0.0.0',1080)"
     env = os.environ.copy()
     env.update({"PYTHONPATH": str(APP_DIR), "LOCAL_PROXY_HOST": "0.0.0.0", "LOCAL_PROXY_PORT": str(PROXY_PORT)})

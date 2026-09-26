@@ -26,8 +26,43 @@ def parse_non_negative_int(value: str | None, default: int) -> int:
 MAX_PROXY_CONNECTIONS = parse_positive_int(os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS"), 256)
 proxy_connection_sem = threading.BoundedSemaphore(MAX_PROXY_CONNECTIONS)
 
-DNS_CACHE_MAX_ENTRIES = min(8192, parse_non_negative_int(os.environ.get("LOCAL_PROXY_DNS_CACHE_SIZE"), 1024))
+DNS_CACHE_MAX_ENTRIES = min(8192, parse_non_negative_int(os.environ.get("LOCAL_PROXY_DNS_CACHE_SIZE"), 256))
 DNS_CACHE_MAX_TTL = min(3600, parse_positive_int(os.environ.get("LOCAL_PROXY_DNS_CACHE_TTL"), 300))
+
+
+def parse_dns_servers(value: str | None) -> tuple[str, ...]:
+    servers = []
+    for item in str(value or "1.1.1.1,8.8.8.8,9.9.9.9").split(","):
+        item = item.strip()
+        try:
+            socket.inet_pton(socket.AF_INET, item)
+        except OSError:
+            continue
+        if item not in servers:
+            servers.append(item)
+    return tuple(servers[:4]) or ("1.1.1.1", "8.8.8.8", "9.9.9.9")
+
+
+DNS_SERVERS = parse_dns_servers(os.environ.get("LOCAL_PROXY_DNS_SERVERS"))
+_failure_log_lock = threading.Lock()
+_failure_log_times: dict[str, tuple[float, int]] = {}
+
+
+def proxy_log(message: str, rate_key: str = "", interval: float = 30.0) -> None:
+    """Rate-limit repeated tunnel/DNS errors so a bad exit cannot fill disk."""
+    if not rate_key:
+        print(message, flush=True)
+        return
+    now = time.monotonic()
+    with _failure_log_lock:
+        previous, suppressed = _failure_log_times.get(rate_key, (0.0, 0))
+        if now - previous < interval:
+            _failure_log_times[rate_key] = (previous, suppressed + 1)
+            return
+        _failure_log_times[rate_key] = (now, 0)
+    if suppressed:
+        message += f"（此前同类错误已抑制 {suppressed} 次）"
+    print(message, flush=True)
 
 
 class _DNSFlight:
@@ -364,7 +399,7 @@ def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) 
     finally:
         _dns_cache.finish(scope, key, flight, answer, _dns_cache_scope() == scope)
 
-def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float = 3.0) -> str | None:
+def resolve_dns_over_tun0(host: str, dns_server: str | None = None, timeout: float = 3.0) -> str | None:
     try:
         socket.inet_aton(host)
         return host
@@ -379,18 +414,31 @@ def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float
         key = _dns_host_key(host)
     except (UnicodeError, ValueError):
         return None
+    servers = (dns_server,) if dns_server else DNS_SERVERS
+    per_query_timeout = max(0.5, float(timeout) / max(1, len(servers)))
     if DNS_CACHE_MAX_ENTRIES == 0:
-        return dns_query_over_tun0(host, 1, dns_server, timeout) or dns_query_over_tun0(host, 28, dns_server, timeout)
+        for qtype in (1, 28):
+            for server in servers:
+                answer = dns_query_over_tun0(host, qtype, server, per_query_timeout)
+                if answer is not None:
+                    return answer
+        return None
     scope = _dns_cache_scope()
     if scope is not None:
         # An AAAA cache hit must not repeat an earlier unsuccessful A request.
         for qtype in (1, 28):
-            cached = _dns_cache.lookup(scope, (key, qtype, dns_server))
-            if cached is not None:
-                return cached
+            for server in servers:
+                cached = _dns_cache.lookup(scope, (key, qtype, server))
+                if cached is not None:
+                    return cached
     else:
         _dns_cache.clear()
-    return dns_query_over_tun0(host, 1, dns_server, timeout) or dns_query_over_tun0(host, 28, dns_server, timeout)
+    for qtype in (1, 28):
+        for server in servers:
+            answer = dns_query_over_tun0(host, qtype, server, per_query_timeout)
+            if answer is not None:
+                return answer
+    return None
 
 def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
     host, port = address
@@ -473,7 +521,10 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
         try:
             upstream = create_connection((host, port), timeout=20)
         except Exception as e:
-            print(f"[SOCKS5 代理失败] 目标 {host}:{port} 连接失败: {e}", flush=True)
+            proxy_log(
+                f"[SOCKS5 代理失败] 目标 {host}:{port} 连接失败: {e}",
+                f"socks:{host}:{port}:{type(e).__name__}:{e}",
+            )
             try:
                 client.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
             except OSError:
@@ -566,7 +617,10 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         upstream.sendall(request.encode("iso-8859-1") + rest)
         relay(client, upstream)
     except Exception as e:
-        print(f"[HTTP 代理失败] 代理请求目标连接失败: {e}", flush=True)
+        proxy_log(
+            f"[HTTP 代理失败] 代理请求目标连接失败: {e}",
+            f"http:{type(e).__name__}:{e}",
+        )
         try:
             client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
         except OSError:
