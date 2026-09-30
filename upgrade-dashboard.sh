@@ -20,11 +20,12 @@ if [[ -z "$ref" ]]; then
 fi
 [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || { echo '无法确定升级版本，请稍后重试'; exit 1; }
 base="https://raw.githubusercontent.com/GaryTung/newinstall/$ref"
-sources=(vpngate_manager.py xui_multi_provision.py multi_exit_manager.py channel_network.py channel_policy.py migrate_network_slots.py resource_guard.py proxy_server.py)
-for file in "${sources[@]}" VERSION; do
+python_sources=(vpngate_manager.py xui_multi_provision.py multi_exit_manager.py channel_network.py channel_policy.py migrate_network_slots.py resource_guard.py proxy_server.py)
+support_sources=(node-gateway-cert-renew.sh node-gateway-cert-renew.service node-gateway-cert-renew.timer)
+for file in "${python_sources[@]}" "${support_sources[@]}" VERSION; do
   curl -fsSL --retry 2 --connect-timeout 15 "$base/$file" -o "$work/$file"
 done
-for file in "${sources[@]}"; do
+for file in "${python_sources[@]}"; do
   python3 -m py_compile "$work/$file"
 done
 
@@ -33,6 +34,9 @@ targets=(
   "$app/migrate_network_slots.py" "$app/resource_guard.py" "$app/VERSION"
   "$app/exit_speed.py" "$app/proxy_server.py" /var/lib/aimilivpn-multiexit/speed_results.json
   /usr/local/sbin/xui-multi-provision /usr/local/sbin/aimilivpn-multiexit
+  /usr/local/sbin/node-gateway-cert-renew
+  /etc/systemd/system/node-gateway-cert-renew.service
+  /etc/systemd/system/node-gateway-cert-renew.timer
   /var/lib/aimilivpn-multiexit/channels.json /var/lib/aimilivpn-multiexit/state.json
   /var/lib/aimilivpn-multiexit/deep_failures.json /var/lib/aimilivpn-multiexit/verified_exits.json
   /etc/x-ui/multi-exit-result.json /etc/x-ui/x-ui.db
@@ -58,6 +62,7 @@ rollback() {
       fi
     done
   fi
+  systemctl daemon-reload
   for service in x-ui aimilivpn-multiexit aimilivpn; do
     for active in "${active_services[@]}"; do
       [[ "$service" != "$active" ]] || systemctl start "$service"
@@ -91,8 +96,13 @@ install -m 0755 "$work/migrate_network_slots.py" "$app/migrate_network_slots.py"
 install -m 0755 "$work/vpngate_manager.py" "$app/vpngate_manager.py"
 install -m 0755 "$work/xui_multi_provision.py" /usr/local/sbin/xui-multi-provision
 install -m 0755 "$work/multi_exit_manager.py" /usr/local/sbin/aimilivpn-multiexit
+install -m 0755 "$work/node-gateway-cert-renew.sh" /usr/local/sbin/node-gateway-cert-renew
+install -m 0644 "$work/node-gateway-cert-renew.service" /etc/systemd/system/node-gateway-cert-renew.service
+install -m 0644 "$work/node-gateway-cert-renew.timer" /etc/systemd/system/node-gateway-cert-renew.timer
 install -m 0644 "$work/VERSION" "$app/VERSION"
 python3 "$work/migrate_network_slots.py" --apply
+systemctl daemon-reload
+systemctl enable node-gateway-cert-renew.timer
 systemctl start x-ui
 systemctl start aimilivpn-multiexit
 systemctl start aimilivpn
@@ -100,6 +110,7 @@ sleep 8
 systemctl is-active --quiet x-ui
 systemctl is-active --quiet aimilivpn-multiexit
 systemctl is-active --quiet aimilivpn
+systemctl start node-gateway-cert-renew.timer
 trap - ERR INT TERM
 printf '后台升级完成：已移除下载测速与测速择优，保留有界 DNS 缓存；线路将自动恢复。备份：%s\n' "$backup"
 printf '%s\n' '既有 systemd 应急暂停配置保持不变；若之前暂停了后台任务，升级不会解除该暂停。'

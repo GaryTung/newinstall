@@ -102,12 +102,15 @@ issue_missing_certificate() {
   /root/.acme.sh/acme.sh --install-cert -d "${cert_name}" \
     --key-file "${cert_dir}/privkey.pem" \
     --fullchain-file "${cert_dir}/fullchain.pem" \
-    --reloadcmd 'systemctl try-restart x-ui.service || true'
+    --reloadcmd 'systemctl try-restart x-ui.service aimilivpn.service || true'
 }
 
 [[ ${EUID} -eq 0 ]] || fail "请使用 sudo bash unified-install.sh 运行"
 [[ -f "${SCRIPT_DIR}/install-core.sh" ]] || fail "安装包不完整：缺少 install-core.sh"
 [[ -f "${SCRIPT_DIR}/xui_provision.py" ]] || fail "安装包不完整：缺少 xui_provision.py"
+for required_file in node-gateway-cert-renew.sh node-gateway-cert-renew.service node-gateway-cert-renew.timer; do
+  [[ -f "${SCRIPT_DIR}/${required_file}" ]] || fail "安装包不完整：缺少 ${required_file}"
+done
 
 printf '%s\n' '统一节点系统安装向导'
 printf '%s\n' '1) VLESS + TLS（TCP）'
@@ -218,29 +221,9 @@ if [[ -x /usr/local/x-ui/x-ui ]]; then
 fi
 
 printf '%s\n' '[3/5] 加固证书自动续签...'
-cat > /etc/systemd/system/node-gateway-cert-renew.service <<'EOF'
-[Unit]
-Description=Renew 3x-ui TLS certificate
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/root/.acme.sh/acme.sh --cron --home /root/.acme.sh
-ExecStartPost=/bin/systemctl try-restart x-ui.service
-EOF
-cat > /etc/systemd/system/node-gateway-cert-renew.timer <<'EOF'
-[Unit]
-Description=Daily TLS certificate renewal check
-
-[Timer]
-OnCalendar=*-*-* 03:25:00
-RandomizedDelaySec=45m
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
+install -o root -g root -m 0755 "${SCRIPT_DIR}/node-gateway-cert-renew.sh" /usr/local/sbin/node-gateway-cert-renew
+install -o root -g root -m 0644 "${SCRIPT_DIR}/node-gateway-cert-renew.service" /etc/systemd/system/node-gateway-cert-renew.service
+install -o root -g root -m 0644 "${SCRIPT_DIR}/node-gateway-cert-renew.timer" /etc/systemd/system/node-gateway-cert-renew.timer
 systemctl daemon-reload
 systemctl enable --now node-gateway-cert-renew.timer
 
