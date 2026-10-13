@@ -28,6 +28,7 @@ done
 for file in "${python_sources[@]}"; do
   python3 -m py_compile "$work/$file"
 done
+bash -n "$work/node-gateway-cert-renew.sh"
 
 targets=(
   "$app/vpngate_manager.py" "$app/channel_network.py" "$app/channel_policy.py"
@@ -46,6 +47,11 @@ active_services=()
 for service in aimilivpn aimilivpn-multiexit x-ui; do
   if systemctl is-active --quiet "$service"; then active_services+=("$service"); fi
 done
+timer_was_active=0
+if systemctl is-active --quiet node-gateway-cert-renew.timer; then
+  timer_was_active=1
+  systemctl stop node-gateway-cert-renew.timer
+fi
 restore_ready=0
 rollback() {
   local status="${1:-1}" index target
@@ -68,6 +74,11 @@ rollback() {
       [[ "$service" != "$active" ]] || systemctl start "$service"
     done
   done
+  if [[ "$timer_was_active" == 1 ]]; then
+    systemctl start node-gateway-cert-renew.timer
+  else
+    systemctl stop node-gateway-cert-renew.timer 2>/dev/null || true
+  fi
   printf '升级失败，已恢复备份的程序和配置，原有服务已尝试重新启动。备份：%s\n' "$backup" >&2
   printf '迁移过的内部网络会在服务重连时重新配置；请检查 sudo journalctl -u aimilivpn-multiexit -n 60\n' >&2
   exit "$status"
@@ -110,7 +121,9 @@ sleep 8
 systemctl is-active --quiet x-ui
 systemctl is-active --quiet aimilivpn-multiexit
 systemctl is-active --quiet aimilivpn
-systemctl start node-gateway-cert-renew.timer
+/usr/local/sbin/node-gateway-cert-renew --mark-loaded
+systemctl restart node-gateway-cert-renew.timer
 trap - ERR INT TERM
 printf '后台升级完成：已移除下载测速与测速择优，保留有界 DNS 缓存；线路将自动恢复。备份：%s\n' "$backup"
+printf '%s\n' '证书每 10 分钟核对一次；发现续签后自动重载 3x-ui 和总订阅服务。'
 printf '%s\n' '既有 systemd 应急暂停配置保持不变；若之前暂停了后台任务，升级不会解除该暂停。'

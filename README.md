@@ -104,6 +104,10 @@ sudo ml restart
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/GaryTung/newinstall/main/upgrade-dashboard.sh)"
 ```
 
+升级到 `.54` 后，证书任务每 10 分钟核对一次已安装证书。acme.sh 续签后，即使它自己的旧重载命令只处理 3x-ui，核对任务也会发现证书变化并重启 3x-ui 与总订阅服务。证书未变化时不会重启服务，也不会运行节点测速。续签检查最多每天运行一次。
+
+可用 `sudo systemctl status node-gateway-cert-renew.timer` 查看定时器；需要立即核对并重载时，运行 `sudo /usr/local/sbin/node-gateway-cert-renew --check`。如果磁盘上的证书仍过期，先检查 `sudo journalctl -u node-gateway-cert-renew.service -n 80 --no-pager` 和证书签发日志；此任务无法在签发失败时制造新证书。
+
 ## 安全提示
 
 订阅链接相当于访问凭据，请勿公开分享。本仓库不包含任何 VPS私钥、后台密码、订阅密钥、节点缓存或运行日志。

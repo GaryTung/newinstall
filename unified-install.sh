@@ -225,7 +225,6 @@ install -o root -g root -m 0755 "${SCRIPT_DIR}/node-gateway-cert-renew.sh" /usr/
 install -o root -g root -m 0644 "${SCRIPT_DIR}/node-gateway-cert-renew.service" /etc/systemd/system/node-gateway-cert-renew.service
 install -o root -g root -m 0644 "${SCRIPT_DIR}/node-gateway-cert-renew.timer" /etc/systemd/system/node-gateway-cert-renew.timer
 systemctl daemon-reload
-systemctl enable --now node-gateway-cert-renew.timer
 
 printf '%s\n' '[4/5] 自动创建入站、订阅和出口路由...'
 systemctl stop x-ui
@@ -251,6 +250,9 @@ fi
 
 printf '%s\n' '[5/6] 安装多国家独立出口（默认 7866 日本 HY2、7888 韩国 HY2）...'
 bash "${SCRIPT_DIR}/install-multi-exit.sh"
+/usr/local/sbin/node-gateway-cert-renew --mark-loaded
+systemctl enable node-gateway-cert-renew.timer
+systemctl restart node-gateway-cert-renew.timer
 
 printf '%s\n' '[6/6] 设置防火墙并输出结果...'
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
@@ -274,7 +276,7 @@ print('协议：', result['protocol'])
 print('节点端口：', result['port'])
 print('通用订阅：', result['subscription'])
 print('Clash 订阅：', result['clash'])
-print('续签定时器：node-gateway-cert-renew.timer（每天自动检查）')
+print('续签定时器：node-gateway-cert-renew.timer（每 10 分钟核对证书，每天检查续签）')
 PY
 
 show_available_info

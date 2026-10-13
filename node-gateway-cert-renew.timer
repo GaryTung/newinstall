@@ -1,10 +1,9 @@
 [Unit]
-Description=Daily TLS certificate renewal check
+Description=Check gateway certificate changes every ten minutes
 
 [Timer]
-OnCalendar=*-*-* 03:25:00
-RandomizedDelaySec=45m
-Persistent=true
+OnBootSec=5min
+OnUnitActiveSec=10min
 
 [Install]
 WantedBy=timers.target
