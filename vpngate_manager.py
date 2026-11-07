@@ -702,12 +702,34 @@ def ensure_bundle_token() -> str:
     return token
 
 
+def extra_direct_subscriptions(database: str = "/etc/x-ui/x-ui.db") -> list[dict]:
+    """Read additional direct inbounds from SQLite, not a replaceable provisioning result."""
+    if not Path(database).is_file():
+        return []
+    try:
+        db = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2)
+        try:
+            rows = db.execute("""select remark,settings from inbounds where enable=1
+                and (remark like '%.服务器直连-%' or remark like '服务器直连-%')
+                and protocol in ('hysteria','vless','trojan') order by id""").fetchall()
+        finally:
+            db.close()
+        return [{"name": name, "subId": c["subId"]}
+                for name, settings in rows for c in json.loads(settings).get("clients", [])
+                if c.get("enable", True) and c.get("subId")]
+    except (sqlite3.Error, ValueError, TypeError):
+        return []
+
+
 def provisioned_subscription_ids() -> list[str]:
     result = read_json(Path("/etc/x-ui/multi-exit-result.json"), {"channels": []})
     ids: list[str] = []
     direct_id = str((result.get("direct") or {}).get("subId") or "")
     if direct_id:
         ids.append(direct_id)
+    for item in extra_direct_subscriptions():
+        if item["subId"] not in ids:
+            ids.append(item["subId"])
     enabled_ids = {str(c.get("id") or "") for c in read_multi_exit_config().get("channels", []) if c.get("enabled", True)}
     for item in result.get("channels", []):
         if str(item.get("id") or "") in enabled_ids:
@@ -725,6 +747,8 @@ def provisioned_subscription_names() -> dict[str, str]:
     direct = result.get("direct") or {}
     if direct.get("subId"):
         names[str(direct["subId"])] = server_node_name("服务器直连")
+    for item in extra_direct_subscriptions():
+        names[item["subId"]] = item["name"]
     for item in result.get("channels", []):
         sub_id = str(item.get("subId") or "")
         if sub_id:

@@ -54,6 +54,12 @@ allow 2097 tcp
 allow ${panel_port} tcp
 allow ${sub_port} tcp
 allow ${node_port} ${node_transport}
+# Include all generated direct protocols after provisioning, including on reboot.
+if [[ -f /etc/x-ui/gateway-result.json ]]; then
+  python3 -c 'import json; r=json.load(open("/etc/x-ui/gateway-result.json")); [print(i["port"], "udp" if i["protocol"] == "hysteria" else "tcp") for i in r.get("directs", [])]' | while read -r port transport; do
+    allow "\$port" "\$transport"
+  done
+fi
 EOF
   chmod 0755 /usr/local/sbin/node-gateway-open-ports
   cat > /etc/systemd/system/node-gateway-firewall.service <<'EOF'
@@ -113,6 +119,7 @@ for required_file in node-gateway-cert-renew.sh node-gateway-cert-renew.service 
 done
 
 printf '%s\n' '统一节点系统安装向导'
+printf '%s\n' '将同时创建 HY2、VLESS、Trojan 三种服务器直连；下方选择主直连协议及端口，其余自动分配空闲端口。'
 printf '%s\n' '1) VLESS + TLS（TCP）'
 printf '%s\n' '2) Trojan + TLS（TCP）'
 printf '%s\n' '3) Hysteria2 + TLS（UDP）'
@@ -238,7 +245,13 @@ result_json="$(/usr/local/sbin/node-gateway-provision \
   --cert "${cert_file}" \
   --key "${key_file}" \
   --proxy-port "${PROXY_PORT:-7928}" \
+  --reserve-port "${panel_port}" \
   --sub-port "${sub_port}")"
+
+# Open only the generated transports; retain the user's choice to keep a firewall.
+while read -r transport port; do
+  allow_local_port "$port" "$transport" 'Server direct inbound'
+done < <(python3 -c 'import json; r=json.load(open("/etc/x-ui/gateway-result.json")); [print("udp" if i["protocol"] == "hysteria" else "tcp", i["port"]) for i in r.get("directs", [])]')
 
 systemctl restart x-ui
 sleep 5
@@ -275,6 +288,10 @@ result = json.loads(Path('/etc/x-ui/gateway-result.json').read_text(encoding='ut
 print('\n统一节点系统安装完成')
 print('协议：', result['protocol'])
 print('节点端口：', result['port'])
+for item in result.get('directs', []):
+    transport = 'UDP' if item['protocol'] == 'hysteria' else 'TCP'
+    print(f"直连：{item['name']} / {item['protocol']} / {item['port']} {transport}（云安全组需放行）")
+print('三种直连请使用后台的总订阅；下列单节点订阅仅为主直连。')
 print('通用订阅：', result['subscription'])
 print('Clash 订阅：', result['clash'])
 print('续签定时器：node-gateway-cert-renew.timer（每 10 分钟核对证书，每天检查续签）')
