@@ -108,7 +108,7 @@ issue_missing_certificate() {
 [[ ${EUID} -eq 0 ]] || fail "请使用 sudo bash unified-install.sh 运行"
 [[ -f "${SCRIPT_DIR}/install-core.sh" ]] || fail "安装包不完整：缺少 install-core.sh"
 [[ -f "${SCRIPT_DIR}/xui_provision.py" ]] || fail "安装包不完整：缺少 xui_provision.py"
-for required_file in node-gateway-cert-renew.sh node-gateway-cert-renew.service node-gateway-cert-renew.timer; do
+for required_file in node-gateway-cert-renew.sh node-gateway-cert-renew.service node-gateway-cert-renew.timer configure-udp-buffer.sh; do
   [[ -f "${SCRIPT_DIR}/${required_file}" ]] || fail "安装包不完整：缺少 ${required_file}"
 done
 
@@ -228,6 +228,7 @@ systemctl daemon-reload
 
 printf '%s\n' '[4/5] 自动创建入站、订阅和出口路由...'
 systemctl stop x-ui
+bash "${SCRIPT_DIR}/configure-udp-buffer.sh"
 install -o root -g root -m 0700 "${SCRIPT_DIR}/xui_provision.py" /usr/local/sbin/node-gateway-provision
 result_json="$(/usr/local/sbin/node-gateway-provision \
   --protocol "${protocol}" \

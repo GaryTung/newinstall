@@ -21,7 +21,7 @@ fi
 [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || { echo '无法确定升级版本，请稍后重试'; exit 1; }
 base="https://raw.githubusercontent.com/GaryTung/newinstall/$ref"
 python_sources=(vpngate_manager.py xui_multi_provision.py multi_exit_manager.py channel_network.py channel_policy.py migrate_network_slots.py resource_guard.py proxy_server.py)
-support_sources=(node-gateway-cert-renew.sh node-gateway-cert-renew.service node-gateway-cert-renew.timer)
+support_sources=(node-gateway-cert-renew.sh node-gateway-cert-renew.service node-gateway-cert-renew.timer configure-udp-buffer.sh)
 for file in "${python_sources[@]}" "${support_sources[@]}" VERSION; do
   curl -fsSL --retry 2 --connect-timeout 15 "$base/$file" -o "$work/$file"
 done
@@ -29,8 +29,12 @@ for file in "${python_sources[@]}"; do
   python3 -m py_compile "$work/$file"
 done
 bash -n "$work/node-gateway-cert-renew.sh"
+bash -n "$work/configure-udp-buffer.sh"
+previous_rmem_default=$(sysctl -n net.core.rmem_default)
+previous_rmem_max=$(sysctl -n net.core.rmem_max)
 
 targets=(
+  /etc/sysctl.d/90-hy2-udp-recv.conf
   "$app/vpngate_manager.py" "$app/channel_network.py" "$app/channel_policy.py"
   "$app/migrate_network_slots.py" "$app/resource_guard.py" "$app/VERSION"
   "$app/exit_speed.py" "$app/proxy_server.py" /var/lib/aimilivpn-multiexit/speed_results.json
@@ -69,6 +73,7 @@ rollback() {
     done
   fi
   systemctl daemon-reload
+  sysctl -w "net.core.rmem_max=$previous_rmem_max" "net.core.rmem_default=$previous_rmem_default"
   for service in x-ui aimilivpn-multiexit aimilivpn; do
     for active in "${active_services[@]}"; do
       [[ "$service" != "$active" ]] || systemctl start "$service"
@@ -99,6 +104,7 @@ for index in "${!targets[@]}"; do
   fi
 done
 restore_ready=1
+bash "$work/configure-udp-buffer.sh"
 install -m 0644 "$work/channel_network.py" "$app/channel_network.py"
 install -m 0644 "$work/channel_policy.py" "$app/channel_policy.py"
 install -m 0644 "$work/resource_guard.py" "$app/resource_guard.py"
@@ -126,4 +132,5 @@ systemctl restart node-gateway-cert-renew.timer
 trap - ERR INT TERM
 printf '后台升级完成：已移除下载测速与测速择优，保留有界 DNS 缓存；线路将自动恢复。备份：%s\n' "$backup"
 printf '%s\n' '证书每 10 分钟核对一次；发现续签后自动重载 3x-ui 和总订阅服务。'
+printf '%s\n' 'UDP 接收缓冲区默认值及上限均为 4 MiB；代理服务已重新启动以应用设置。'
 printf '%s\n' '既有 systemd 应急暂停配置保持不变；若之前暂停了后台任务，升级不会解除该暂停。'
