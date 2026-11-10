@@ -24,7 +24,7 @@ open_all_host_ports() {
     "${firewall_cmd}" -P OUTPUT ACCEPT
     "${firewall_cmd}" -F
   done
-  DEBIAN_FRONTEND=noninteractive apt_get_wait purge -y netfilter-persistent iptables-persistent >/dev/null 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt_get_wait purge -y netfilter-persistent iptables-persistent || true
   printf '%s\n' 'Ubuntu 本机防火墙已开放；Oracle Cloud 的 VCN/NSG 仍需在控制台单独放行。'
 }
 
